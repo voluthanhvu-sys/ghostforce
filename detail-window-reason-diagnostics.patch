@@ -1,0 +1,43 @@
+diff --git "a/ghostforge-server.js" b/ghostforge-server.js
+index 266872f..4d5469f 100644
+--- "a/ghostforge-server.js"
++++ b/ghostforge-server.js
+@@ -64,6 +64,22 @@ const shortPromptHash = (value) => crypto
+     .digest('hex')
+     .slice(0, 8);
+ 
++const logParsedDetailWindows = (frames, prefix, onLog) => {
++    const ordered = [...(Array.isArray(frames) ? frames : [])]
++        .sort((a, b) => Number(a?.a) - Number(b?.a));
++    ordered.forEach((frame, index) => {
++        const clean = (value, max = 160) => String(value || '')
++            .replace(/[\r\n\t]+/g, ' ')
++            .replace(/\s+/g, ' ')
++            .trim()
++            .slice(0, max);
++        const who = clean(frame?.who, 80);
++        const why = clean(frame?.why || frame?.reason);
++        const whoText = who ? ` · who=${who}` : '';
++        onLog(`[EDIT] ${prefix} window ${index + 1}/${ordered.length}: ${Number(frame?.a).toFixed(1)}-${Number(frame?.b).toFixed(1)} ${frame?.mode || ''}${whoText} · why=${JSON.stringify(why)}`);
++    });
++};
++
+ let encoderCaps = null;
+ 
+ const ffmpegEnv = { ...process.env, CUDA_VISIBLE_DEVICES: '0' };
+@@ -3587,6 +3603,7 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                     const parsedContain = detailSeg.frames.filter((frame) => frame?.mode === 'contain').length;
+                     const parsedFill = detailSeg.frames.filter((frame) => frame?.mode === 'fill').length;
+                     send('log', { message: `[EDIT] Detail PLAN ${ordinal} modes: raw contain=${rawModeCounts.contain} fill=${rawModeCounts.fill} other=${rawModeCounts.other} · parsed contain=${parsedContain} fill=${parsedFill}` });
++                    logParsedDetailWindows(detailSeg.frames, 'Detail', (message) => send('log', { message }));
+                     plan.segments[index] = mergeSegmentDetail(seg, detailSeg);
+                     detailPlanSegmentIndexes.add(index);
+                     detailEnriched += 1;
+@@ -4088,6 +4105,7 @@ app.get('/api/edit/part-test/stream/:jobId', async (req, res) => {
+         const parsedContain = detailSeg.frames.filter((frame) => frame?.mode === 'contain').length;
+         const parsedFill = detailSeg.frames.filter((frame) => frame?.mode === 'fill').length;
+         send('log', { message: `[EDIT] Detail PLAN Part ${partIndex} modes: raw contain=${rawCounts.contain} fill=${rawCounts.fill} other=${rawCounts.other} · parsed contain=${parsedContain} fill=${parsedFill}` });
++        logParsedDetailWindows(detailSeg.frames, 'TARGETED Detail', (message) => send('log', { message }));
+ 
+         const fallbackSpeech = plan?._raw ? parseSpeechLines(plan._raw, duration) : [];
+         let localTurns = null;

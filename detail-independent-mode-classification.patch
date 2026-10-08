@@ -1,0 +1,34 @@
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -140,6 +140,9 @@ FRAMING — required. 9:16 mix of WIDE vs CLOSE. Re-evaluate framing often, but l
+    DIALOGUE GUARD: in normal dialogue with 1–2 visible puppets, FILL the speaking/focal puppet when a useful medium crop exists; do not mark the whole interaction CONTAIN merely because another puppet is visible. With 3 visible puppets, generally FILL the active speaker when a useful medium crop exists; three puppets alone is NOT sufficient reason for CONTAIN.
+    WIDE-ONLY EXCEPTIONS: reserve CONTAIN for genuine wide/context needs such as a crowd or many puppets whose necessary context would be lost, an establishing/context shot, CCTV/laptop/poster/calendar/prop-only insert, a genuinely off-camera speaker, or a source shot already so tight that further cropping is harmful.
+    ANTI-DEGENERATE CHECK: do NOT return an all-CONTAIN plan for a normal dialogue segment. All-CONTAIN is allowed only when essentially the entire segment genuinely consists of the WIDE-ONLY EXCEPTIONS above. Before returning JSON, if frames[] contains zero FILL windows, re-check whether the segment truly qualifies as wide-only; if ordinary visible dialogue exists, create the appropriate FILL window(s).
++   INDEPENDENT MODE CLASSIFICATION: classify EACH segmented framing-decision window independently. Do not inherit CONTAIN from the previous window, the same room/background, the same conversation, another visible puppet, or the overall scene containing multiple characters. For the CURRENT window, choose FILL when one subject's face, reaction, or action clearly controls visual attention and a normal FILL crop preserves the information needed for that beat.
++   CONTAIN requires information that is simultaneously necessary to understand the CURRENT visual beat and would actually be lost by a normal FILL crop: for example, two subjects' simultaneous actions/expressions are both essential, a prop/cause and reaction truly must remain visible together, or an action materially spans the wide frame and cannot be represented by one focal crop. Merely having 2 or 3 visible characters is NOT sufficient. If one character performs the dominant reaction/action while another character is only contextual, prefer FILL on the dominant visual subject.
++   REACTION/ACTION MODE: a strong reaction, tantrum, accusation, physical gag, or expressive action performed primarily by one visible subject should normally be FILL when that subject can be framed without losing essential simultaneous context. Do NOT keep it CONTAIN merely because another character remains visible. If the dominant visual subject materially changes, segmentation must create a new window first; never solve that change by keeping one wide CONTAIN window.
+    MODE SELECTION FIRST: first classify every visually continuous shot as CONTAIN or FILL using the normal framing rules, DIALOGUE GUARD, REACTION rule, and WIDE-ONLY EXCEPTIONS above. Reaction-focus metadata MUST NOT influence whether a shot is classified as CONTAIN or FILL. Evaluate focusLock only AFTER a shot has already been classified as FILL. Do not choose CONTAIN merely because focalWho or focalCx is uncertain, a reaction lock is not applicable, or focusLock fields are omitted. If a normal dialogue/reaction shot qualifies for FILL under the framing rules, keep it FILL even when no focusLock metadata is emitted.
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -66,6 +66,22 @@ test('detail framing rejects degenerate all-contain dialogue without a fill quot
+   assert.doesNotMatch(guidance, /50[–-]65%/);
+ });
+ 
++test('detail classifies each segmented window independently with a strict contain gate', () => {
++  const guidance = detailSemanticFramingGuidance();
++  assert.match(guidance, /classify EACH segmented framing-decision window independently/i);
++  assert.match(guidance, /Do not inherit CONTAIN from the previous window, the same room\/background, the same conversation/i);
++  assert.match(guidance, /Merely having 2 or 3 visible characters is NOT sufficient/i);
++  assert.match(guidance, /choose FILL when one subject's face, reaction, or action clearly controls visual attention/is);
++  assert.match(guidance, /strong reaction, tantrum, accusation, physical gag, or expressive action.*should normally be FILL/is);
++  assert.match(guidance, /two subjects' simultaneous actions\/expressions are both essential/i);
++  assert.match(guidance, /prop\/cause and reaction truly must remain visible together/i);
++  assert.match(guidance, /action materially spans the wide frame/i);
++  assert.match(guidance, /segmentation must create a new window first.*never solve that change by keeping one wide CONTAIN window/is);
++  assert.doesNotMatch(guidance, /minimum FILL count|target FILL\/CONTAIN ratio|max(?:imum)? CONTAIN duration/i);
++  assert.match(guidance, /focusLock only AFTER a shot has already been classified as FILL/i);
++});
++
+ test('detail frames require concrete reasons for contain and fill', () => {

@@ -1,0 +1,350 @@
+diff --git "a/ghostforge-server.js" b/ghostforge-server.js
+index 56a59c0..633916e 100644
+--- "a/ghostforge-server.js"
++++ b/ghostforge-server.js
+@@ -3845,6 +3845,202 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+     }
+ });
+ 
++function targetedPartRanges(segment) {
++    const source = Array.isArray(segment?.pieces) && segment.pieces.length
++        ? segment.pieces
++        : (Array.isArray(segment?.ranges) && segment.ranges.length ? segment.ranges : null);
++    const ranges = source
++        ? source.map((piece) => Array.isArray(piece)
++            ? [Number(piece[0]), Number(piece[1])]
++            : [Number(piece?.start), Number(piece?.end)])
++        : [[Number(segment?.start), Number(segment?.end)]];
++    if (!ranges.length || ranges.some(([start, end]) => !Number.isFinite(start) || !Number.isFinite(end) || end <= start)) {
++        throw new Error('Selected part has no valid source pieces/ranges');
++    }
++    return ranges;
++}
++
++app.post('/api/edit/part-test', (req, res) => {
++    try {
++        const parentPart = jobs.get(String(req.body?.partJobId || ''));
++        if (!parentPart || parentPart.kind !== 'edit-part' || !parentPart.inputPath || !fs.existsSync(parentPart.inputPath)) {
++            return res.status(404).json({ error: 'Original source for this part is no longer available' });
++        }
++        const segment = req.body?.segment || {};
++        const ranges = targetedPartRanges(segment);
++        const jobId = crypto.randomBytes(16).toString('hex');
++        jobs.set(jobId, {
++            kind: 'edit-part-test',
++            inputPath: parentPart.inputPath,
++            keepInput: true,
++            originalName: parentPart.originalName,
++            segment: { ...segment, ranges },
++            partIndex: Math.max(1, Number(segment.partIndex) || 1),
++            settings: {
++                apiKey: String(req.body?.apiKey || ''),
++                model: String(req.body?.model || 'gemini-3.8-flash'),
++                prompt: String(req.body?.prompt || ''),
++                encoderMode: String(req.body?.encoderMode || 'auto'),
++            },
++            status: 'pending',
++        });
++        res.json({ jobId });
++    } catch (err) {
++        res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
++    }
++});
++
++app.get('/api/edit/part-test/stream/:jobId', async (req, res) => {
++    const jobId = req.params.jobId;
++    const job = jobs.get(jobId);
++    if (!job || job.kind !== 'edit-part-test') return res.status(404).end();
++    const send = subscribeJob(job, res);
++    if (!send) return;
++
++    const settings = job.settings || {};
++    const apiKey = String(settings.apiKey || '').trim();
++    const model = String(settings.model || 'gemini-3.8-flash');
++    const userPrompt = String(settings.prompt || '').trim();
++    const segment = job.segment || {};
++    const partIndex = job.partIndex || 1;
++    const ranges = targetedPartRanges(segment);
++    const rangeText = ranges.map(([a, b]) => `${a.toFixed(2)}-${b.toFixed(2)}s`).join(', ');
++    const excerptPath = path.join(uploadsDir, `${jobId}_source.mp4`);
++    const proxyPath = path.join(uploadsDir, `${jobId}_detail.mp4`);
++    const outputPath = path.join(uploadsDir, `${jobId}_output.mp4`);
++    job.editEncoder = resolveEncoder(settings.encoderMode);
++    job.editOnLog = (message) => send('log', { message });
++    job.outputPath = outputPath;
++    job.settings.apiKey = '';
++    const logTiming = (phase, startedAt) => send('log', {
++        message: `[EDIT TIMING] ${phase}: ${((Date.now() - startedAt) / 1000).toFixed(2)}s`,
++    });
++
++    try {
++        send('log', { message: `[EDIT] TARGETED PART TEST: Part ${partIndex} · original source · ${rangeText}` });
++        const sourceProbe = await probeMedia(job.inputPath);
++        send('log', { message: `[EDIT] Target source ${sourceProbe.width}x${sourceProbe.height} · pieces ${rangeText}` });
++        if (!(sourceProbe.width > sourceProbe.height)) {
++            throw new Error(`Targeted Part requires original landscape source; got ${sourceProbe.width}x${sourceProbe.height}`);
++        }
++        send('progress', { value: 5, phase: 'extract' });
++        await cutEditClip(job.inputPath, excerptPath, { ...segment, ranges }, job, false);
++        const excerptProbe = await probeMedia(excerptPath);
++        const duration = Number(excerptProbe.durationSec) || ranges.reduce((sum, [a, b]) => sum + b - a, 0);
++        const sceneCuts = compactSceneCutHints(await detectSceneTimes(excerptPath, duration, job), duration);
++
++        const proxyStartedAt = Date.now();
++        await runEditEncode([
++            '-y', '-i', excerptPath, '-vf', "scale='min(854,iw)':-2", '-r', '12',
++        ], [
++            '-c:a', 'aac', '-b:a', '64k', '-ac', '1', '-movflags', '+faststart', proxyPath,
++        ], job, 32, true);
++        logTiming(`detail proxy Part ${partIndex}`, proxyStartedAt);
++
++        const detailMinSec = Math.max(12, Math.min(25, duration * 0.35));
++        let plan;
++        if (apiKey) {
++            const uploaded = await geminiUploadVideo(apiKey, proxyPath, `target-part-${partIndex}`);
++            try {
++                const startedAt = Date.now();
++                plan = await geminiGeneratePlan(apiKey, model, uploaded.uri, userPrompt, duration, 1, detailMinSec, false, true, true, sceneCuts);
++                logTiming(`detail AI Part ${partIndex}`, startedAt);
++            } finally {
++                await geminiDeleteFile(apiKey, uploaded.name);
++            }
++        } else {
++            const auth = await getAdcAuth();
++            plan = await vertexGeneratePlan(
++                auth, model, proxyPath, userPrompt, duration, 1, detailMinSec, job,
++                (message) => send('log', { message }), false, true, true,
++                `detail AI Part ${partIndex}`, sceneCuts,
++            );
++        }
++        const detailSeg = plan?.segments?.[0];
++        if (!detailSeg?.frames?.length || !detailSeg?.track?.length) throw new Error('detail PLAN missing framing or speaker track');
++        const rawSegments = plan?._raw?.segments || plan?._raw?.clips || [];
++        const rawSegment = Array.isArray(rawSegments) ? rawSegments[0] : null;
++        const rawFrames = rawSegment ? (rawSegment.frames || rawSegment.framing || rawSegment.shots || rawSegment.layout || []) : [];
++        const rawCounts = { contain: 0, fill: 0, other: 0 };
++        for (const frame of Array.isArray(rawFrames) ? rawFrames : []) {
++            const mode = normalizeFrameMode(Array.isArray(frame) ? frame[2] : frame?.mode || frame?.kind || frame?.framing || frame?.type);
++            if (mode === 'contain') rawCounts.contain += 1;
++            else if (mode === 'fill') rawCounts.fill += 1;
++            else rawCounts.other += 1;
++        }
++        const parsedContain = detailSeg.frames.filter((frame) => frame?.mode === 'contain').length;
++        const parsedFill = detailSeg.frames.filter((frame) => frame?.mode === 'fill').length;
++        send('log', { message: `[EDIT] Detail PLAN Part ${partIndex} modes: raw contain=${rawCounts.contain} fill=${rawCounts.fill} other=${rawCounts.other} · parsed contain=${parsedContain} fill=${parsedFill}` });
++
++        const fallbackSpeech = plan?._raw ? parseSpeechLines(plan._raw, duration) : [];
++        let localTurns = null;
++        let localMapping = null;
++        try {
++            const startedAt = Date.now();
++            localTurns = await runLocalDiarization(excerptPath, job);
++            localMapping = mapDiarizationToPlan(localTurns, plan, (message) => send('log', { message }));
++            if (!localMapping.ok) throw new Error(localMapping.reason);
++            logTiming('local speaker diarization', startedAt);
++        } catch (err) {
++            if (job.cancelled) throw err;
++            localTurns = null;
++            localMapping = null;
++            send('log', { message: `[EDIT] Local Listen fallback: ${err instanceof Error ? err.message : String(err)}`.slice(0, 240) });
++        }
++        let speech = fallbackSpeech;
++        const sttStartedAt = Date.now();
++        try {
++            const auth = await getAdcAuth();
++            const words = await googleSttWords(auth, excerptPath, duration, job, (message) => send('log', { message }));
++            if (localTurns && localMapping && words.length) {
++                speech = [
++                    ...mergeDiarizationWords(words, localMapping),
++                    ...snapLinesToWords(fallbackSpeechForAmbiguousTurns(fallbackSpeech, localMapping.ambiguousTurns, localMapping.mappedTurns), words),
++                ].sort((a, b) => a.t - b.t);
++            } else if (words.length && speech.length) {
++                speech = snapLinesToWords(speech, words);
++            }
++        } catch (err) {
++            if (job.cancelled) throw err;
++            send('log', { message: `[EDIT] Google STT skip: ${err instanceof Error ? err.message : String(err)}`.slice(0, 220) });
++        } finally {
++            logTiming('Google STT', sttStartedAt);
++        }
++
++        send('progress', { value: 70, phase: 'render' });
++        await mixFrameClip(excerptPath, outputPath, job, (message) => send('log', { message }), detailSeg.frames, detailSeg.track, speech);
++        const title = String(segment.title || segment.name || `Part ${partIndex}`).replace(/\.(mp4|mov|webm|m4v)$/i, '');
++        const outputName = safeDownloadName(`TEST Part ${partIndex} - ${title}.mp4`);
++        job.originalName = outputName;
++        job.status = 'done';
++        send('progress', { value: 100, phase: 'done' });
++        send('log', { message: `[EDIT] TARGETED PART TEST SUCCESS: ${outputName}` });
++        send('done', {
++            ...segment,
++            ranges,
++            name: outputName,
++            title: `TEST Part ${partIndex} - ${title}`,
++            partIndex,
++            jobId,
++            downloadUrl: `/api/download/${jobId}`,
++        });
++        res.end();
++    } catch (err) {
++        const message = err instanceof Error ? err.message : String(err);
++        send('log', { message: `[EDIT] TARGETED PART TEST ERROR: ${message}` });
++        send('error', { message });
++        if (!res.writableEnded) res.end();
++    } finally {
++        for (const file of [excerptPath, proxyPath, proxyPath.replace(/\.mp4$/i, '_small.mp4')]) {
++            try { fs.unlinkSync(file); } catch { /* ignore */ }
++        }
++        for (let index = 1; index <= 6; index++) {
++            try { fs.unlinkSync(proxyPath.replace(/\.mp4$/i, `_s${index}.mp4`)); } catch { /* ignore */ }
++        }
++    }
++});
++
++
+ async function cutEditClip(src, dest, seg, job, fadeFx) {
+     const ranges = Array.isArray(seg.ranges) && seg.ranges.length
+         ? seg.ranges
+diff --git "a/src/ghostforge-app.tsx" "b/src/ghostforge-app.tsx"
+index d1c8ec5..3490dc9 100644
+--- "a/src/ghostforge-app.tsx"
++++ "b/src/ghostforge-app.tsx"
+@@ -546,7 +546,7 @@ export default function App() {
+                             setEditWatchPct(100);
+                             setEditPhase('cut');
+                             setEditProgress(42);
+-                            const segs = (data.segments || []).map((s: { start: number; end: number; dur?: number; name: string; title?: string; titleVi?: string; reason?: string; script?: string }, i: number) => ({
++                            const segs = (data.segments || []).map((s: { start: number; end: number; dur?: number; pieces?: EditSegment['pieces']; ranges?: EditSegment['ranges']; name: string; title?: string; titleVi?: string; reason?: string; script?: string }, i: number) => ({
+                                 id: newClipId(),
+                                 sourceId: clip.id,
+                                 sourceName: clip.name,
+@@ -581,13 +581,13 @@ export default function App() {
+                                     || (typeof data.start === 'number' && s.start === data.start)
+                                     || s.name === safeFileName(data.name)
+                                 )
+-                                    ? { ...s, status: 'cut', jobId: data.jobId, downloadUrl: data.downloadUrl, name: safeFileName(data.name) }
++                                    ? { ...s, pieces: data.pieces || s.pieces, ranges: data.ranges || s.ranges, status: 'cut', jobId: data.jobId, downloadUrl: data.downloadUrl, name: safeFileName(data.name) }
+                                     : s
+                             ));
+                         } else if (data.type === 'done') {
+                             settled = true;
+                             drop();
+-                            const finalSegs: EditSegment[] = (data.segments || segsAcc).map((s: { start: number; end: number; dur?: number; name: string; title?: string; titleVi?: string; reason?: string; script?: string; jobId?: string; downloadUrl?: string }, i: number) => ({
++                            const finalSegs: EditSegment[] = (data.segments || segsAcc).map((s: { start: number; end: number; dur?: number; pieces?: EditSegment['pieces']; ranges?: EditSegment['ranges']; name: string; title?: string; titleVi?: string; reason?: string; script?: string; jobId?: string; downloadUrl?: string }, i: number) => ({
+                                 id: segsAcc[i]?.id || newClipId(),
+                                 sourceId: clip.id,
+                                 sourceName: clip.name,
+@@ -723,6 +723,93 @@ export default function App() {
+         if (!already) addLog('[EDIT] Cancel — abort Gemini ngay.');
+     };
+ 
++    const testEditPart = async (seg: EditSegment) => {
++        if (editBusyRef.current || !seg.jobId) return;
++        const hasPieces = Boolean((seg.pieces?.length || 0) > 0 || (seg.ranges?.length || 0) > 0);
++        if (!hasPieces && !(Number.isFinite(seg.start) && Number.isFinite(seg.end))) {
++            addLog('[EDIT] TARGETED PART TEST ERROR: Part này thiếu pieces/ranges hoặc start/end.');
++            return;
++        }
++        editCancelRef.current = false;
++        editBusyRef.current = true;
++        setEditBusy(true);
++        setPartTestBusyId(seg.id);
++        setEditProgress(0);
++        setEditPhase('targeted-part');
++        try {
++            const response = await fetch(`${BACKEND_URL}/api/edit/part-test`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    partJobId: seg.jobId,
++                    segment: {
++                        name: seg.name,
++                        title: seg.title,
++                        partIndex: seg.partIndex,
++                        start: seg.start,
++                        end: seg.end,
++                        pieces: seg.pieces,
++                        ranges: seg.ranges,
++                    },
++                    apiKey: editApiKey,
++                    model: editModel,
++                    prompt: editPrompt,
++                    encoderMode: editEncoderMode,
++                }),
++            });
++            const created = await response.json().catch(() => ({}));
++            if (!response.ok || !created.jobId) throw new Error(created.error || `HTTP ${response.status}`);
++            editJobRef.current = created.jobId;
++            await new Promise<void>((resolve, reject) => {
++                const es = new EventSource(`${BACKEND_URL}/api/edit/part-test/stream/${created.jobId}`);
++                let settled = false;
++                const finish = (fn: () => void) => {
++                    if (settled) return;
++                    settled = true;
++                    es.close();
++                    fn();
++                };
++                es.onmessage = (event) => {
++                    const data = JSON.parse(event.data);
++                    if (data.type === 'log') addLog(data.message);
++                    else if (data.type === 'progress') {
++                        const value = Number(data.value);
++                        if (Number.isFinite(value)) setEditProgress(Math.max(0, Math.min(100, value)));
++                        if (data.phase) setEditPhase(String(data.phase));
++                    } else if (data.type === 'done') {
++                        const result: EditSegment = {
++                            ...seg,
++                            id: newClipId(),
++                            name: safeFileName(data.name),
++                            title: data.title || data.name,
++                            pieces: data.pieces || seg.pieces,
++                            ranges: data.ranges || seg.ranges,
++                            status: 'cut',
++                            jobId: data.jobId,
++                            downloadUrl: data.downloadUrl,
++                            saved: false,
++                            savedTo: undefined,
++                            savedFile: undefined,
++                        };
++                        setEditSegments((prev) => [...prev, result]);
++                        setEditSelectedIds((prev) => [...prev, result.id]);
++                        finish(resolve);
++                    } else if (data.type === 'error') {
++                        finish(() => reject(new Error(data.message)));
++                    }
++                };
++                es.onerror = () => finish(() => reject(new Error('Targeted Part stream disconnected')));
++            });
++        } catch (err) {
++            addLog(`[EDIT] TARGETED PART TEST ERROR: ${err instanceof Error ? err.message : String(err)}`);
++        } finally {
++            editJobRef.current = null;
++            editBusyRef.current = false;
++            setEditBusy(false);
++            setPartTestBusyId(null);
++        }
++    };
++
+     const addReframeFiles = useCallback((incoming: File[]) => {
+         const videos = incoming.filter((f) => f.type.startsWith('video/') || /\.(mp4|mov|webm|mkv|avi|m4v)$/i.test(f.name));
+         if (!videos.length) {
+@@ -3126,7 +3213,8 @@ export default function App() {
+                                                         <div className="flex flex-wrap gap-1">
+                                                             {seg.status === 'cut' && seg.jobId && (
+                                                                 <>
+-                                                                    <button
++                                                                    {((seg.pieces?.length || 0) > 0 || (seg.ranges?.length || 0) > 0 || (Number.isFinite(seg.start) && Number.isFinite(seg.end))) && (
++                                                                        <button
+                                                                             type="button"
+                                                                             onClick={() => void testEditPart(seg)}
+                                                                             disabled={editBusy || partTestBusyId === seg.id}
+diff --git "a/src/types.ts" "b/src/types.ts"
+index 106316a..bd30aae 100644
+--- "a/src/types.ts"
++++ "b/src/types.ts"
+@@ -6,4 +6,4 @@ export interface ProcessingStats {
+ }
+ export interface QueueResult { name: string; originalName: string; jobId: string; downloadUrl: string; stats?: ProcessingStats; saved?: boolean; savedTo?: string; savedFile?: string; failed?: boolean; error?: string; }
+ export interface QueueClip { id: string; file: File; name: string; originalName: string; outFolder?: string; localPath?: string; fileSize?: number; }
+-export interface EditSegment { id: string; sourceId: string; sourceName: string; name: string; title?: string; titleVi?: string; partIndex: number; parts: number; start?: number; end?: number; dur?: number; script?: string; reason?: string; status: 'planned' | 'cut' | 'sent' | 'failed'; jobId?: string; downloadUrl?: string; saved?: boolean; savedTo?: string; savedFile?: string; }
++export interface EditSegment { id: string; sourceId: string; sourceName: string; name: string; title?: string; titleVi?: string; partIndex: number; parts: number; start?: number; end?: number; dur?: number; pieces?: Array<{ start: number; end: number } | [number, number]>; ranges?: Array<[number, number]>; script?: string; reason?: string; status: 'planned' | 'cut' | 'sent' | 'failed'; jobId?: string; downloadUrl?: string; saved?: boolean; savedTo?: string; savedFile?: string; }

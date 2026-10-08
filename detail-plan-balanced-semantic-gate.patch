@@ -1,0 +1,44 @@
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -123,7 +123,9 @@ FRAMING — required. 9:16 mix of WIDE vs CLOSE. Re-evaluate framing often, but le
+    contain = WIDE (full 16:9 small in 9:16 + blur bars). Use CONTAIN for crowds, inserts, CCTV/laptop/poster/calendar views, prop-only shots, source shots already visually tight, or whenever cropping would lose relevant visual information.
+-   fill = MEDIUM 1:1 crop (head + shoulders + chest). A visible speaker or two-shot makes FILL a candidate, not an automatic choice.
+-   Choose FILL only when one subject clearly dominates the visual meaning AND cropping does not remove important action, reaction, object/prop, text, visual gag, second participant, spatial relationship, camera movement, or context. Otherwise choose CONTAIN.
+-   TWO-SHOT: use CONTAIN when both reactions matter, physical interaction matters, the joke depends on both characters, action spans both sides, or cropping removes relevant context. Use FILL only when one subject clearly dominates and the second subject is nonessential background/context.
+-   REACTION: FILL may be used when the reaction is isolated and visually dominant. Keep CONTAIN when the reaction and its cause/action need to remain visible together or cropping would hide the source of the joke/action.
+-   Candidate scene boundaries are re-evaluation points only. They do not imply FILL, a mode change, or a mandatory split; keep the same mode across a boundary when the semantic and information-loss decision remains the same.
++   fill = MEDIUM 1:1 crop (head + shoulders + chest). A speaker or two-shot alone determines neither FILL nor CONTAIN.
++   FILL: choose FILL when one subject is the clear focal point of the current shot AND a reasonable subject crop preserves all information necessary to understand the current beat.
++   CONTAIN: choose CONTAIN only when important information necessary to understand the current shot would actually fall outside a reasonable subject crop.
++   The mere presence of another person, prop/object, background context, movement, reaction, or spatial context is NOT enough by itself to require CONTAIN. Use CONTAIN only when losing it would materially hurt understanding of the action, joke, reaction, relationship, reveal, or visual beat.
++   TWO-SHOT: the two-shot alone determines neither mode. Use FILL when one person is clearly focal, the second person is not needed to understand the beat, and a reasonable crop preserves the meaning. Use CONTAIN when both expressions/actions are simultaneously necessary, their interaction is the beat/joke, important action spans both sides, or the crop would materially remove needed information.
++   REACTION: use FILL for an isolated reaction when the reacting subject is clearly focal. Use CONTAIN when the reaction and its cause/action must be visible together to understand the moment.
++   At EVERY candidate scene cut, make a fresh independent framing classification for the new shot itself. Do not inherit CONTAIN merely because the story or context is similar. The mode may remain the same across the cut only because the new shot independently satisfies the same decision. This requires fresh classification, not a mandatory FILL, CONTAIN, mode change, or split.
+    HARD: speaker is NOT in this camera shot → CONTAIN.
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -46,14 +46,19 @@ test('detail framing uses a semantic information-loss gate without fill quotas'
+   const guidance = detailSemanticFramingGuidance();
+   assert.doesNotMatch(guidance, /50[–-]65%/);
+   assert.doesNotMatch(guidance, /wide 2[–-]4s then fill/i);
+-  assert.match(guidance, /speaker or two-shot makes FILL a candidate, not an automatic choice/i);
++  assert.doesNotMatch(guidance, /alternate often/i);
++  assert.match(guidance, /speaker or two-shot alone determines neither FILL nor CONTAIN/i);
+   assert.match(guidance, /visual-information preservation/i);
+-  assert.match(guidance, /cropping does not remove important action, reaction, object\/prop, text, visual gag, second participant, spatial relationship/i);
++  assert.match(guidance, /reasonable subject crop preserves all information necessary to understand the current beat/i);
++  assert.match(guidance, /important information necessary to understand the current shot would actually fall outside a reasonable subject crop/i);
++  assert.match(guidance, /mere presence of another person, prop\/object, background context, movement, reaction, or spatial context is NOT enough/i);
+ });
+ 
+ test('detail scene-cut hints remain non-mandatory re-evaluation points', () => {
+   const guidance = `${detailSemanticFramingGuidance()}${detailSceneCutGuidance([4.2], 10)}`;
+   assert.match(guidance, /Candidate visual shot boundaries.*4\.2/);
+   assert.match(guidance, /hints, not mandatory cuts/i);
+-  assert.match(guidance, /do not imply FILL, a mode change, or a mandatory split/i);
++  assert.match(guidance, /At EVERY candidate scene cut, make a fresh independent framing classification/i);
++  assert.match(guidance, /mode may remain the same across the cut only because the new shot independently satisfies the same decision/i);
++  assert.match(guidance, /not a mandatory FILL, CONTAIN, mode change, or split/i);
+ });

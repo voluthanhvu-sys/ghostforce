@@ -1,0 +1,111 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -10,7 +10,7 @@ import { fileURLToPath } from 'url';
+ import { runProcess } from './server/process.js';
+ import { jobs, subscribeJob, jobSignal, abortJob, ensureAbort } from './server/jobs.js';
+ import { createSaveDirStore } from './server/save-dir.js';
+-import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, normalizeFrameMode, stitchFrames, clamp01, parseFraming, parseSpeakerTrack, snapSpeakerTrack, clampPlan, parseGeminiPlan } from './server/editor-plan.js';
++import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, sourceTimeForTrackPoint, normalizeFrameMode, stitchFrames, clamp01, parseFraming, parseSpeakerTrack, snapSpeakerTrack, clampPlan, parseGeminiPlan } from './server/editor-plan.js';
+ 
+ const __dirname = path.dirname(fileURLToPath(import.meta.url));
+ const app = express();
+@@ -3073,17 +3073,35 @@ const planSpeakerIntervals = (plan) => {
+     for (const seg of plan?.segments || []) {
+         const base = Number(seg.start) || 0;
+         const end = Number(seg.end) || base;
++        const pieces = Array.isArray(seg.pieces) && seg.pieces.length
++            ? seg.pieces
++            : [{ start: base, end }];
+         const pts = (Array.isArray(seg.track) ? seg.track : [])
+             .filter((p) => p && Number.isFinite(p.t) && String(p.who || '').trim())
+-            .map((p) => ({ ...p, sourceT: base + p.t }))
++            .map((p) => {
++                const sourceT = sourceTimeForTrackPoint(pieces, p.t, base);
++                const piece = pieces.find((x) => sourceT >= Number(x.start) && sourceT <= Number(x.end));
++                return {
++                    ...p,
++                    sourceT,
++                    pieceStart: Number(piece?.start ?? base),
++                    pieceEnd: Number(piece?.end ?? end),
++                };
++            })
+             .sort((a, b) => a.sourceT - b.sourceT);
+         for (let i = 0; i < pts.length; i++) {
+             const p = pts[i];
+-            const left = i ? (pts[i - 1].sourceT + p.sourceT) / 2 : base;
+-            const right = i + 1 < pts.length ? (p.sourceT + pts[i + 1].sourceT) / 2 : end;
++            const previous = pts[i - 1];
++            const next = pts[i + 1];
++            const left = previous?.pieceStart === p.pieceStart
++                ? (previous.sourceT + p.sourceT) / 2
++                : p.pieceStart;
++            const right = next?.pieceStart === p.pieceStart
++                ? (p.sourceT + next.sourceT) / 2
++                : p.pieceEnd;
+             intervals.push({
+-                start: Math.max(base, left, p.sourceT - 1.5),
+-                end: Math.min(end, right, p.sourceT + 1.5),
++                start: Math.max(p.pieceStart, left, p.sourceT - 1.5),
++                end: Math.min(p.pieceEnd, right, p.sourceT + 1.5),
+                 t: p.sourceT,
+                 who: String(p.who).trim(),
+                 cx: p.cx,
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -52,6 +52,24 @@ export const scriptLabel = (pieces) => pieces.map((p) => {
+     return `${tag}${p.start}–${p.end}`;
+ }).join(' > ');
+ 
++export const sourceTimeForTrackPoint = (pieces, trackTime, fallbackStart = 0) => {
++    const t = Number(trackTime);
++    const valid = (Array.isArray(pieces) ? pieces : [])
++        .map((p) => ({ start: Number(p?.start), end: Number(p?.end) }))
++        .filter((p) => Number.isFinite(p.start) && Number.isFinite(p.end) && p.end > p.start);
++    if (!Number.isFinite(t) || valid.length <= 1) return Number(fallbackStart) + t;
++    let accumulated = 0;
++    for (let i = 0; i < valid.length; i++) {
++        const piece = valid[i];
++        const duration = piece.end - piece.start;
++        if (t < accumulated + duration || (i === valid.length - 1 && t <= accumulated + duration)) {
++            return piece.start + Math.max(0, t - accumulated);
++        }
++        accumulated += duration;
++    }
++    return Number(fallbackStart) + t;
++};
++
+ export const normalizeFrameMode = (raw) => {
+     const m = String(raw || '').toLowerCase();
+     if (/fill|close|tight|crop|cận|zoom/.test(m)) return 'fill';
+@@ -348,4 +366,3 @@ export const parseGeminiPlan = (text, duration, maxParts, minSec, autoParts = fa
+     if (!segs.length) throw new Error('Gemini returned no usable segments');
+     return { summary: String(parsed.summary || '').slice(0, 300), segments: segs, _raw: parsed };
+ };
+-
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan } from '../server/editor-plan.js';
++import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan, sourceTimeForTrackPoint } from '../server/editor-plan.js';
+ 
+ test('evenSplitPlan creates contiguous bounded segments', () => {
+   const segs = evenSplitPlan(360, 3, 60, false);
+@@ -25,3 +25,12 @@ test('parseGeminiPlan accepts basic JSON segment plan', () => {
+   assert.ok(Array.isArray(out.segments));
+   assert.ok(out.segments.length >= 1);
+ });
++
++test('sourceTimeForTrackPoint preserves one-piece mapping', () => {
++  assert.equal(sourceTimeForTrackPoint([{ start: 20, end: 30 }], 4.5, 20), 24.5);
++});
++
++test('sourceTimeForTrackPoint maps concatenated time into the second piece', () => {
++  const pieces = [{ start: 10, end: 15 }, { start: 40, end: 50 }];
++  assert.equal(sourceTimeForTrackPoint(pieces, 7, 10), 42);
++});
+

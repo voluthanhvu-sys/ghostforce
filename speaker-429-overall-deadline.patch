@@ -1,0 +1,108 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -2670,8 +2670,25 @@
+ async function vertexJsonVideo(auth, model, videoPath, prompt, job, onLog, opts = {}) {
++    const t0 = Date.now();
++    const overallTimeoutMs = Math.max(0, Number(opts.overallTimeoutMs) || 0);
++    const deadlineAt = overallTimeoutMs > 0 ? t0 + overallTimeoutMs : 0;
++    const deadlineError = () => {
++        const err = new Error(`Speaker AI overall deadline reached (${Math.round(overallTimeoutMs / 1000)}s)`);
++        err.code = 'SPEAKER_AI_DEADLINE';
++        return err;
++    };
++    const remainingMs = () => deadlineAt > 0 ? deadlineAt - Date.now() : Infinity;
++    const requireRemaining = () => {
++        if (job && job.cancelled) throw new Error('cancelled');
++        const remaining = remainingMs();
++        if (remaining <= 0) throw deadlineError();
++        return remaining;
++    };
+     const shrunk = await shrinkProxyForVertex(videoPath, job, onLog);
++    requireRemaining();
+     const b64 = (await fs.promises.readFile(shrunk.filePath)).toString('base64');
++    requireRemaining();
+     const modelId = vertexModelId(model);
+     const locations = [...new Set([auth.location || 'us-central1', 'global'])];
+     const body = JSON.stringify({
+@@ -2684,22 +2701,24 @@
+     });
+     let lastErr = '';
+     let invalidJsonResponses = 0;
+-    const t0 = Date.now();
+     const timeoutMs = Math.max(60_000, Number(opts.timeoutMs) || 12 * 60 * 1000);
++    const displayTimeoutMs = overallTimeoutMs > 0 ? overallTimeoutMs : timeoutMs;
+     const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+-    if (onLog) onLog(`[EDIT] Vertex listen — chờ tối đa ${Math.round(timeoutMs / 1000)}s (thanh % vẫn chạy)`);
++    if (onLog) onLog(`[EDIT] Vertex listen — chờ tối đa ${Math.round(displayTimeoutMs / 1000)}s (thanh % vẫn chạy)`);
+     const pulse = setInterval(() => {
+         if (job && job.cancelled) return;
+-        const s = Math.round((Date.now() - t0) / 1000);
+-        const cap = Math.round(timeoutMs / 1000);
++        const cap = Math.round(displayTimeoutMs / 1000);
++        const s = Math.min(cap, Math.round((Date.now() - t0) / 1000));
+         const pct = Math.min(56, 43 + s * (13 / Math.max(60, cap)));
+         try { onProgress?.(pct); } catch { /* ignore */ }
+         if (onLog) onLog(`[EDIT] Vertex listen still working… ${s}s / ${cap}s`);
+     }, 8000);
+     try {
+     for (const loc of locations) {
++        requireRemaining();
+         const url = `https://${loc === 'global' ? 'aiplatform.googleapis.com' : `${loc}-aiplatform.googleapis.com`}/v1/projects/${auth.project}/locations/${loc}/publishers/google/models/${modelId}:generateContent`;
+         for (let attempt = 1; attempt <= 5; attempt++) {
+-            if (job && job.cancelled) throw new Error('cancelled');
++            requireRemaining();
+             try {
+                 if (attempt > 1) {
++                    requireRemaining();
+                     try { auth = await getAdcAuth(); } catch { /* keep */ }
+-                    await sleepJob(1500 * attempt, job);
++                    const retryDelayMs = 1500 * attempt;
++                    if (remainingMs() <= retryDelayMs) throw deadlineError();
++                    await sleepJob(retryDelayMs, job);
+                 }
++                const fetchTimeoutMs = Math.max(1, Math.floor(Math.min(timeoutMs, requireRemaining())));
+                 const res = await fetch(url, {
+                     method: 'POST',
+                     headers: {
+@@ -2714,13 +2733,17 @@
+                         'x-goog-user-project': auth.project,
+                     },
+                     body,
+-                    signal: jobSignal(job, timeoutMs),
++                    signal: jobSignal(job, fetchTimeoutMs),
+                 });
+                 const j = await res.json().catch(() => ({}));
++                requireRemaining();
+                 if (!res.ok) {
+                     lastErr = j.error?.message || `Vertex ${res.status} @ ${loc}`;
+                     if (isQuotaErr(lastErr, res.status)) {
++                        const quotaWaitMs = Math.min(90, 8 + attempt * attempt * 10) * 1000;
++                        if (remainingMs() <= quotaWaitMs) throw deadlineError();
+                         await waitQuota(job, onLog, attempt);
+                         continue;
+                     }
+@@ -2746,6 +2769,7 @@
+                     if (invalidJsonResponses >= 2) throw new Error(lastErr);
+                     continue;
+                 }
++                requireRemaining();
+                 const lineCount = Array.isArray(parsed?.lines)
+                     ? parsed.lines.length
+                     : Array.isArray(parsed?.speech)
+@@ -2757,6 +2781,7 @@
+                 return parsed;
+             } catch (err) {
+                 if (job && job.cancelled) throw new Error('cancelled');
++                if (err?.code === 'SPEAKER_AI_DEADLINE' || (deadlineAt > 0 && remainingMs() <= 0)) throw deadlineError();
+                 lastErr = err instanceof Error ? err.message : String(err);
+                 if (invalidJsonResponses >= 2 && lastErr.startsWith('Vertex STT JSON invalid')) throw err;
+             }
+@@ -3151,6 +3176,7 @@
+                             (m) => send('log', { message: m }),
+                             {
+                                 timeoutMs: testSec > 0 ? 4 * 60 * 1000 : 12 * 60 * 1000,
++                                overallTimeoutMs: testSec > 0 ? 3 * 60 * 1000 : 0,
+                                 onProgress: (v) => send('progress', { value: v, phase: 'stt' }),
+                             },
+                         );

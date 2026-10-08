@@ -1,0 +1,140 @@
+INVESTIGATION ONLY — Production batch Vertex 429 / quota scheduling
+Không sửa source, không tạo patch, không gọi API/STT/video/test.
+
+CURRENT BATCH EXECUTION:
+- Frontend: `startEdit()` trong src/ghostforge-app.tsx:623-709 dùng một vòng `while` và `await runOneEdit(clip)`. Một lần bấm EDIT trong cùng React instance xử lý đúng một source từ upload/job tới SSE done, toàn bộ cut/render và auto-save rồi mới lấy source kế tiếp.
+- `editBusyRef` chặn bấm Start lần hai trong cùng instance (624); state queue và enforcement này chỉ ở frontend.
+- `runOneEdit()` tạo một job (`/api/edit/job` upload hoặc `/api/edit/job-local`) rồi mở EventSource `/api/edit/stream/:jobId` (474-621).
+- Backend: hai endpoint job chỉ `jobs.set(... status:'pending')` (ghostforge-server.js:1468-1489, 2948-2965). Pipeline thực sự bắt đầu khi một EventSource gọi `/api/edit/stream/:jobId` (2966+). Không có backend batch queue/scheduler.
+- `subscribeJob()` chỉ ngăn chạy lặp cùng job: subscriber thứ hai nhận history và `null`; job khác vẫn chạy độc lập (server/jobs.js:3-31).
+- Kết luận cho một frontend queue: 10-15 video là tuần tự. PLAN video B KHÔNG bắt đầu khi video A đang listen, Google STT, RGB hoặc render, vì `runOneEdit(A)` chưa resolve. Nhưng tab/cửa sổ browser khác, request trực tiếp, hay một job EDIT khác có thể mở stream song song; khi đó các pipeline và Vertex POST có thể chồng nhau.
+
+CURRENT VERTEX CONCURRENCY:
+- Không có `vertexBusy`, semaphore, mutex, request queue, last429At, quotaCooldownUntil hay rate limiter trong source được truy vết.
+- Không có global guard trong `vertexGeneratePlan()` hoặc `vertexJsonVideo()`; mỗi invocation tự fetch/retry.
+- Vì vậy có thể có tối đa một Vertex POST tại một thời điểm chỉ do single frontend queue tình cờ tuần tự, không phải do backend bảo đảm. Hai EDIT jobs khác có thể PLAN/listen đồng thời. Các Vertex workflow khác trong app cũng không dùng shared guard.
+
+CURRENT 429 SCOPE:
+- NONE globally. 429 chỉ tồn tại trong biến cục bộ của invocation hiện tại (`lastErr`, `attempt`, loop location).
+- `waitQuota(job,onLog,attempt)` là cục bộ cho job/call, không ghi shared state (1557-1570).
+- PLAN và Speaker cùng một job không chia 429 state. Jobs khác không biết một job vừa 429.
+- Do đó nhiều job có thể independently retry cùng quota project trong lúc một job đang backoff.
+
+CURRENT RETRY STRUCTURE:
+PLAN (Vertex, TEST và production giống nhau):
+- `vertexGeneratePlan()` (2554-2622) dedup 2 location: configured location + global.
+- 3 attempt/location => tối đa 6 full-video POST.
+- Per-fetch timeout 15 phút. Không có overall deadline.
+- 429: waitQuota attempt 1/2/3 = 18s/48s/90s, rồi retry. Retry attempt 2/3 còn refresh ADC best-effort và raw delay 4s/6s.
+- 5xx: retry tiếp, không quota backoff. Empty response/fetch/network error: loop retry. Non-quota 4xx: break location.
+- Lưu ý log trong waitQuota ghi `(.../5)` dù PLAN chỉ có 3 attempt; đây là label chung, không phải retry budget PLAN.
+
+Speaker TEST:
+- `vertexJsonVideo()` (2683-2800), 2 location x 5 attempt => tối đa 10 POST.
+- Per-fetch timeout 4 phút, overallTimeoutMs 180s chỉ khi `testSec > 0` (3189-3197).
+- Overall deadline bao retry/backoff/fetch thời gian còn lại; 429 backoff/retry delay không vừa thời gian còn lại thì throw non-cancel và caller fallback plan._raw + Google STT.
+
+Speaker production:
+- Cùng 2 location x 5 attempt => tối đa 10 full-video POST.
+- Per-fetch timeout 12 phút; `overallTimeoutMs: 0`, nên KHÔNG có production overall deadline.
+- 429 waits mỗi location attempt 1..5: 18+48+90+90+90 = 336s. Retry-delay attempt 2..5: 3+4.5+6+7.5 = 21s. Hai location có thể tạo 714s local sleep, chưa gồm auth, response time hoặc tối đa 10 fetch x 12 phút.
+- 5xx/empty/network exception retry trong local loop; 429 dùng waitQuota. Invalid JSON success response có global-to-invocation counter 2; đến lần invalid thứ hai throw ngay để caller fallback, không tiếp tục gửi full video qua location khác.
+
+LONG VIDEO REQUEST BEHAVIOR:
+- PLAN tạo proxy toàn source rồi gửi inline base64 toàn proxy một lần cho mỗi POST retry (`vertexGeneratePlan`: 2555-2570).
+- Dedicated Speaker tạo proxy toàn source riêng rồi gửi inline base64 toàn proxy cho mỗi POST retry (`vertexJsonVideo`: 2699-2714). Đây là hai inference call toàn video bình thường, không chung artifact.
+- `shrinkProxyForVertex()` chỉ re-encode local khi proxy vượt ngưỡng inline; nó không tạo inference request. Nhưng retry POST gửi lại body/base64 full proxy.
+- Vì thế long video có thể bị gửi lại toàn proxy nhiều lần sau 429/5xx/network error theo giới hạn ở trên. Source không có production quota-wait budget hay overall deadline để ngăn một Speaker call giữ lớp API nhiều phút.
+
+AUTH/ADC BEHAVIOR:
+- `getAdcAuth()` (2449-2470) chạy gcloud để in access token mỗi lần được gọi, đọc project từ env/ADC files và chỉ gọi `gcloud config get-value project` khi thiếu project.
+- Nó được gọi trước PLAN, trước Speaker, và best-effort trước retry attempt >1 của PLAN/Speaker. Không có token cache trong process.
+- Đây là local shell/network overhead và có thể tăng chậm/contend khi nhiều job; nó không làm tăng Vertex inference quota vì không phải generateContent request.
+
+WHY CURRENT 8s WAIT IS NOT SUFFICIENT:
+- Delay 8s chỉ nằm trong từng EDIT job giữa PLAN hoàn tất và Speaker phase (khoảng 3145-3146), không phải rate limiter, không quan sát 429 và không chia sẻ giữa job.
+- Nó không gate PLAN request của job khác, không kéo dài cooldown sau 429, không serializes các tab/job. Vì vậy nó không bảo đảm quota recovery.
+
+OPTION A — fixed inter-request delay:
+- Chỉ giảm xác suất nếu single queue; không phản ứng với quota pressure, tạo idle thời gian cho mọi batch và vẫn không bảo vệ jobs/tab song song.
+- Không có source evidence cho một số giây cố định phù hợp long video/quota. Không khuyến nghị.
+
+OPTION B — GLOBAL VERTEX MUTEX / SERIALIZER:
+- Một mutex backend cho POST generateContent ngăn đồng thời inference request giữa EDIT jobs.
+- Single frontend queue đã tuần tự, nên lợi ích chính là nhiều tab/direct jobs/các Vertex operation song song.
+- Nếu giữ lock trong toàn retry/backoff invocation, một 429 job có thể độc chiếm lock nhiều phút. Nếu chỉ giữ lock cho POST, nó bảo vệ concurrency nhưng không chia knowledge 429; job khác vẫn POST trong quota cooldown. Đơn lẻ là chưa đủ.
+
+OPTION C — GLOBAL ADAPTIVE 429 COOLDOWN:
+- Khi một POST 429, shared `quotaCooldownUntil` được cập nhật; POST mới ở mọi job phải chờ cancellation-aware trước khi gửi.
+- Nó ngăn các job độc lập tiếp tục hammer sau khi đã biết quota pressure, nhưng không ngăn hai POST cùng bắt đầu trước 429 hoặc race khi cooldown hết.
+- Không cần token bucket; một timestamp max cooldown là đủ cho scope nhỏ.
+
+OPTION D — GLOBAL SERIALIZER + ADAPTIVE 429 COOLDOWN:
+- An toàn nhất cho batch 10-15 long video. Gate chỉ serialize thời điểm POST/response, trước POST kiểm tra shared cooldown và sau 429 cập nhật cooldown cho toàn app.
+- Không nên giữ mutex khi sleep quota của riêng job; release mutex, nhưng mọi request mới sẽ bị shared cooldown chặn. Như vậy CPU/FFmpeg của jobs khác vẫn có thể tiếp tục nếu đã qua AI phase, còn POST mới không hammer quota.
+- Cần re-check cooldown sau khi acquire mutex để tránh race. FIFO/cancellation-aware waiter tránh zombie request và giảm một job tái-chiếm unfairly.
+
+RECOMMENDED DESIGN:
+D — global serializer + adaptive 429 cooldown.
+- Source cho thấy frontend sequential chỉ là best effort client-local; backend shared state còn thiếu.
+- D giữ hai AI analyses và local retry chất lượng cao, nhưng biến 429 thành tín hiệu chung để batch không tự nhân backoff/full-video POST.
+
+RECOMMENDED 429 POLICY:
+- Hybrid: không fallback ngay. Giữ local retries hiện tại cho Speaker để bảo toàn dedicated who/cx/cy, nhưng mỗi POST đi qua shared gate.
+- Khi 429, set `quotaCooldownUntil = max(existing, now + waitQuota duration)` trước retry. Job hiện tại và mọi job khác chờ gate cancellation-aware; retry khi cooldown qua. Không reset cooldown chỉ vì một request success: để timestamp tự hết là policy nhỏ, tránh reset sớm trong concurrent batch.
+
+RECOMMENDED 5xx POLICY:
+- Giữ local retry/short retry delay hiện tại, không mở global quota cooldown. Source đã phân biệt 5xx với quota; 5xx không chứng minh quota pressure.
+
+RECOMMENDED NETWORK POLICY:
+- Giữ local retry/failure behavior, không mở global quota cooldown. Lỗi socket/network của một client/job không là evidence quota toàn project.
+
+RECOMMENDED INVALID-JSON POLICY:
+- Giữ protection hiện tại: tối đa hai successful-but-invalid JSON response trong Speaker invocation, sau đó fallback. Không globalize; đây là model-output quality/format issue, không phải quota.
+
+PRODUCTION DEADLINE POLICY:
+- Không dùng cùng fixed 180s của TEST: source cho thấy production gửi full proxy dài và fetch default 12 phút; không có dữ liệu source chứng minh 180s đủ cho long-video inference.
+- Lựa chọn source-supported an toàn nhất là D: tách quota-wait budget khỏi per-fetch inference timeout cho production. Chỉ quota/backoff bị bounded theo policy vận hành riêng; inference successful long call vẫn dùng timeout hiện tại. Cần lấy dữ liệu long-video thật trước khi chọn con số production hoặc duration-scaled deadline.
+
+CANCELLATION IMPACT:
+- `abortJob()` abort signal fetch ngay; `sleepJob()` kiểm tra cancel tối đa ~400ms (server/jobs.js:33-57; ghostforge-server.js:1557-1563). Speaker retry delay đã dùng sleepJob.
+- PLAN retry delay hiện dùng raw setTimeout 2s * attempt, nên cancel có thể chờ hết delay đó trước lần check kế tiếp; quota wait của PLAN đã cancellation-aware.
+- Global gate/cooldown nên tái sử dụng sleepJob/ensureAbort semantics hoặc equivalent cancellation-aware wait; check cancelled trước enqueue, sau wake, và trước POST. Hủy job phải loại/skip waiter để không có zombie queued request.
+
+EXPECTED API/QUOTA EFFECT:
+- Không đổi model/proxy/prompt/số call normal. Giảm POST chồng nhau sau 429 và giảm duplicate full-video retries giữa jobs đang cùng quota pressure. Dedicated Speaker có thêm cơ hội thành công sau shared cooldown thay vì fallback do mỗi job tự hammer.
+
+EXPECTED THROUGHPUT EFFECT:
+- Inference POST serialized nên throughput peak giảm khi jobs vốn chồng nhau, nhưng current one-tab batch đã sequential nên hầu như không giảm ở đường chính. Trong quota pressure, total batch completion dự kiến ổn định hơn và ít thời gian retry waste; CPU/RGB/FFmpeg ở job đã qua AI có thể vẫn chạy theo kiến trúc hiện tại.
+
+IMPLEMENTATION COMPLEXITY:
+MEDIUM
+- Core state/gate nhỏ, nhưng phải chạm cả PLAN/Speaker request sites, retry/cancellation, và ensure fairness. Không cần pipeline redesign/UI/API mới.
+
+EXACT FUNCTIONS THAT WOULD CHANGE:
+- `vertexGeneratePlan()` — đưa từng Vertex POST qua shared gate, cập nhật global cooldown trên 429.
+- `vertexJsonVideo()` — tương tự; giữ TEST deadline và invalid JSON logic.
+- `waitQuota()` hoặc helper quota duration mới — chia sẻ duration/cooldown update mà không thay policy call count.
+- Một helper gate mới cạnh `sleepJob`/`waitQuota`; PLAN retry delay nên dùng cancellation-aware helper khi chạm phần này.
+
+NEW INTERNAL STATE REQUIRED:
+- `vertexQuotaCooldownUntil` (timestamp) và mutex/FIFO promise queue hoặc equivalent backend-only state. Có thể cần waiter cancellation bookkeeping.
+
+PUBLIC API/UI CHANGES REQUIRED:
+NO
+
+NEW AI CALL REQUIRED:
+NO
+
+QUALITY SETTINGS CHANGED:
+NO
+
+REGRESSION RISKS:
+- Deadlock/queue fairness nếu mutex được giữ trong backoff hoặc cancellation không remove waiter.
+- Nếu global cooldown áp sai cho 5xx/network, throughput giảm không cần thiết.
+- Nếu bỏ local retries để dựa vào scheduler, dedicated Speaker fallback tăng. Cả ba tránh được bằng D và policy phân loại trên.
+
+SAFEST IMPLEMENTATION ORDER:
+1. Tạo helper backend-only cancellation-aware shared cooldown + POST serializer, không đổi API/UI/prompt/proxy.
+2. Áp helper vào PLAN và Speaker generateContent POST; trên 429 update cooldown, giữ retry/location count và fallback hiện có.
+3. Thêm targeted non-network test cho gate/cancel/cooldown nếu module hóa tối thiểu cho phép; sau đó test long batch nhỏ có quan sát log, không chạy API hàng loạt.

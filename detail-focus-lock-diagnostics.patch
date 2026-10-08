@@ -1,0 +1,85 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -64,6 +64,17 @@ const shortPromptHash = (value) => crypto
+     .digest('hex')
+     .slice(0, 8);
+ 
++const hasFiniteFocusCx = (frame) => frame?.focalCx !== null
++    && frame?.focalCx !== ''
++    && Number.isFinite(Number(frame?.focalCx));
++
++const countFocusLocks = (frames) => (Array.isArray(frames) ? frames : []).reduce((counts, frame) => {
++    if (!frame || typeof frame !== 'object' || Array.isArray(frame) || frame.focusLock !== true) return counts;
++    counts.locks += 1;
++    if (hasFiniteFocusCx(frame)) counts.actionable += 1;
++    return counts;
++}, { locks: 0, actionable: 0 });
++
+ const logParsedDetailWindows = (frames, prefix, onLog) => {
+@@ -77,7 +88,20 @@ const logParsedDetailWindows = (frames, prefix, onLog) => {
+         const why = clean(frame?.why || frame?.reason);
+         const whoText = who ? ` · who=${who}` : '';
+-        onLog(`[EDIT] ${prefix} window ${index + 1}/${ordered.length}: ${Number(frame?.a).toFixed(1)}-${Number(frame?.b).toFixed(1)} ${frame?.mode || ''}${whoText} · why=${JSON.stringify(why)}`);
++        const hasFocusMetadata = frame?.focusLock === true
++            || Boolean(frame?.focalWho)
++            || frame?.focalCx !== undefined
++            || frame?.focalCy !== undefined;
++        let focusText = '';
++        if (hasFocusMetadata) {
++            const focalWho = clean(frame?.focalWho, 80);
++            const focalCx = hasFiniteFocusCx(frame) ? Number(frame.focalCx).toFixed(2) : 'invalid';
++            const focalCy = frame?.focalCy !== null && frame?.focalCy !== '' && Number.isFinite(Number(frame?.focalCy))
++                ? ` focalCy=${Number(frame.focalCy).toFixed(2)}`
++                : '';
++            focusText = ` · focusLock=${frame?.focusLock === true}${focalWho ? ` focalWho=${JSON.stringify(focalWho)}` : ''} focalCx=${focalCx}${focalCy}`;
++        }
++        onLog(`[EDIT] ${prefix} window ${index + 1}/${ordered.length}: ${Number(frame?.a).toFixed(1)}-${Number(frame?.b).toFixed(1)} ${frame?.mode || ''}${whoText} · why=${JSON.stringify(why)}${focusText}`);
+     });
+ };
+@@ -3687,7 +3711,13 @@
+                     const parsedContain = detailSeg.frames.filter((frame) => frame?.mode === 'contain').length;
+                     const parsedFill = detailSeg.frames.filter((frame) => frame?.mode === 'fill').length;
++                    const rawFocusCounts = countFocusLocks(rawDetailFrames);
++                    const parsedFocusCounts = countFocusLocks(detailSeg.frames);
+                     send('log', { message: `[EDIT] Detail PLAN ${ordinal} modes: raw contain=${rawModeCounts.contain} fill=${rawModeCounts.fill} other=${rawModeCounts.other} · parsed contain=${parsedContain} fill=${parsedFill}` });
++                    send('log', { message: `[EDIT] Detail focus raw ${ordinal}: locks=${rawFocusCounts.locks} actionable=${rawFocusCounts.actionable}` });
++                    send('log', { message: `[EDIT] Detail focus parsed ${ordinal}: locks=${parsedFocusCounts.locks} actionable=${parsedFocusCounts.actionable}` });
+                     logParsedDetailWindows(detailSeg.frames, 'Detail', (message) => send('log', { message }));
+@@ -4194,7 +4224,13 @@
+         const parsedContain = detailSeg.frames.filter((frame) => frame?.mode === 'contain').length;
+         const parsedFill = detailSeg.frames.filter((frame) => frame?.mode === 'fill').length;
++        const rawFocusCounts = countFocusLocks(rawFrames);
++        const parsedFocusCounts = countFocusLocks(detailSeg.frames);
+         send('log', { message: `[EDIT] Detail PLAN Part ${partIndex} modes: raw contain=${rawCounts.contain} fill=${rawCounts.fill} other=${rawCounts.other} · parsed contain=${parsedContain} fill=${parsedFill}` });
++        send('log', { message: `[EDIT] TARGETED Detail focus raw Part ${partIndex}: locks=${rawFocusCounts.locks} actionable=${rawFocusCounts.actionable}` });
++        send('log', { message: `[EDIT] TARGETED Detail focus parsed Part ${partIndex}: locks=${parsedFocusCounts.locks} actionable=${parsedFocusCounts.actionable}` });
+         logParsedDetailWindows(detailSeg.frames, 'TARGETED Detail', (message) => send('log', { message }));
+@@ -5116,6 +5152,7 @@ export {
+     applySpeechToWindows,
+     splitFillOnSpeaker,
++    countFocusLocks,
+ };
+diff --git a/tests/detail-focus-lock.test.js b/tests/detail-focus-lock.test.js
+--- a/tests/detail-focus-lock.test.js
++++ b/tests/detail-focus-lock.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { applySpeechToWindows, splitFillOnSpeaker } from '../ghostforge-server.js';
++import { applySpeechToWindows, splitFillOnSpeaker, countFocusLocks } from '../ghostforge-server.js';
+@@ -29,3 +29,16 @@ test('speaker track does not split or retarget a valid focus-locked FILL', () =>
+   assert.deepEqual(splitFillOnSpeaker(locked, track), locked);
+ });
++
++test('focus diagnostics distinguish absent, invalid, and actionable locks', () => {
++  assert.deepEqual(countFocusLocks([{ mode: 'fill' }]), { locks: 0, actionable: 0 });
++  assert.deepEqual(countFocusLocks([
++    { focusLock: true },
++    { focusLock: true, focalCx: 'invalid' },
++  ]), { locks: 2, actionable: 0 });
++  assert.deepEqual(countFocusLocks([
++    { focusLock: true, focalCx: 0.72 },
++    { focusLock: true, focalCx: '0.31' },
++  ]), { locks: 2, actionable: 2 });
++});

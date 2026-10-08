@@ -1,0 +1,83 @@
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -117,4 +117,29 @@ export const detailSceneCutGuidance = (sceneCuts, duration) => {
+ `;
+ };
+ 
++export const detailSemanticFramingGuidance = () => `
++FRAMING — required. 9:16 mix of WIDE vs CLOSE. Re-evaluate framing often, but let scene semantics and visual-information preservation determine the mode.
++1) frames[] covers the WHOLE episode, no gaps. Same source timestamps as start/end.
++   contain = WIDE (full 16:9 small in 9:16 + blur bars). Use CONTAIN for crowds, inserts, CCTV/laptop/poster/calendar views, prop-only shots, source shots already visually tight, or whenever cropping would lose relevant visual information.
++   fill = MEDIUM 1:1 crop (head + shoulders + chest). A visible speaker or two-shot makes FILL a candidate, not an automatic choice.
++   Choose FILL only when one subject clearly dominates the visual meaning AND cropping does not remove important action, reaction, object/prop, text, visual gag, second participant, spatial relationship, camera movement, or context. Otherwise choose CONTAIN.
++   TWO-SHOT: use CONTAIN when both reactions matter, physical interaction matters, the joke depends on both characters, action spans both sides, or cropping removes relevant context. Use FILL only when one subject clearly dominates and the second subject is nonessential background/context.
++   REACTION: FILL may be used when the reaction is isolated and visually dominant. Keep CONTAIN when the reaction and its cause/action need to remain visible together or cropping would hide the source of the joke/action.
++   Candidate scene boundaries are re-evaluation points only. They do not imply FILL, a mode change, or a mandatory split; keep the same mode across a boundary when the semantic and information-loss decision remains the same.
++   HARD: speaker is NOT in this camera shot → CONTAIN.
++   HARD: chips / cups / bottles / roulette / signage / black empty / calendar paper insert → CONTAIN.
++   HARD: source already close-up / laptop / poster / CCTV → CONTAIN. Do not fill again.
++   HARD: Never aim fill at a glowing laptop/monitor/flashlight/calendar. Fill a clearly dominant visible subject's FACE.
++   HARD: one fill window = ONE subject. If the dominant subject changes, start a new fill window at that frame. Min fill 1.2s. Instant cut, no pan.
++   HARD: contain windows stay wide. Only FILL hunts the subject.
++2) track[] required: one point about every 0.4 seconds during FILL, every 2s during contain.
++   {"t":12.4,"cx":0.22,"cy":0.44,"who":"Brooklyn"}
++   cx,cy = center of the relevant subject's FACE in the SOURCE frame (0=left/top, 1=right/bottom).
++   who = name of the voice you HEAR at t, not the largest puppet.
++   NEVER default cx=0.5 unless that face is actually in the middle.
++   NEVER set cx to a cup, bottle, chips, poster, laptop, or the brightest blob.
++   Left subject ≈ 0.18–0.32, center ≈ 0.42–0.58, right ≈ 0.68–0.85.
++   Different speaker = new point at that INSTANT with the NEW face. Same speaker = hold the same cx. Camera must CUT, never slide.
++`;
++
+ export const parseSpeechLines = (parsed, duration) => {
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -10,7 +10,7 @@
+ import { runProcess } from './server/process.js';
+ import { jobs, subscribeJob, jobSignal, abortJob, ensureAbort } from './server/jobs.js';
+ import { createSaveDirStore } from './server/save-dir.js';
+-import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, isSpeakerIdentity, resolveSpeakerWho, validSpeakerTrackPoints, shouldUsePerPartDetailPlan, mergeSegmentDetail, compactSceneCutHints, detailSceneCutGuidance, parseSpeechLines, sourceTimeForTrackPoint, normalizeFrameMode, stitchFrames, clamp01, parseFraming, parseSpeakerTrack, snapSpeakerTrack, clampPlan, parseGeminiPlan } from './server/editor-plan.js';
++import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, isSpeakerIdentity, resolveSpeakerWho, validSpeakerTrackPoints, shouldUsePerPartDetailPlan, mergeSegmentDetail, compactSceneCutHints, detailSceneCutGuidance, detailSemanticFramingGuidance, parseSpeechLines, sourceTimeForTrackPoint, normalizeFrameMode, stitchFrames, clamp01, parseFraming, parseSpeakerTrack, snapSpeakerTrack, clampPlan, parseGeminiPlan } from './server/editor-plan.js';
+ import { mapDiarizationEvidence, fallbackSpeechForAmbiguousTurns } from './server/local-listen-map.js';
+ import { runGoogleSttChunkWithRetry } from './server/google-stt-retry.js';
+ import { firstMeaningfulFfmpegError } from './server/ffmpeg-diagnostics.js';
+@@ -2680,2 +2680,2 @@ nameVi: accurate Vietnamese translation. Filename uses the English name.
+-${tiktokMix ? `
++${tiktokMix ? (Array.isArray(sceneCuts) ? detailSemanticFramingGuidance() : `
+ FRAMING — required. 9:16 mix of WIDE vs CLOSE. Target 50–65% of the episode as fill (1:1). Alternate often — do NOT leave the whole scene wide.
+@@ -2702,1 +2702,1 @@
+-` : ''}${detailSceneCutGuidance(sceneCuts, duration)}`;
++`) : ''}${detailSceneCutGuidance(sceneCuts, duration)}`;
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -1,5 +1,5 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan, sourceTimeForTrackPoint, shouldUsePerPartDetailPlan, mergeSegmentDetail, compactSceneCutHints, detailSceneCutGuidance, stitchFrames, isSpeakerIdentity, resolveSpeakerWho, parseSpeechLines } from '../server/editor-plan.js';
++import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan, sourceTimeForTrackPoint, shouldUsePerPartDetailPlan, mergeSegmentDetail, compactSceneCutHints, detailSceneCutGuidance, detailSemanticFramingGuidance, stitchFrames, isSpeakerIdentity, resolveSpeakerWho, parseSpeechLines } from '../server/editor-plan.js';
+ 
+ test('evenSplitPlan creates contiguous bounded segments', () => {
+@@ -44,4 +44,20 @@ test('detail scene-cut guidance is bounded and opt-in', () => {
+   assert.match(guidance, /Do not create more FILL merely to increase density/);
+ });
+ 
++test('detail framing uses a semantic information-loss gate without fill quotas', () => {
++  const guidance = detailSemanticFramingGuidance();
++  assert.doesNotMatch(guidance, /50[–-]65%/);
++  assert.doesNotMatch(guidance, /wide 2[–-]4s then fill/i);
++  assert.match(guidance, /speaker or two-shot makes FILL a candidate, not an automatic choice/i);
++  assert.match(guidance, /visual-information preservation/i);
++  assert.match(guidance, /cropping does not remove important action, reaction, object\/prop, text, visual gag, second participant, spatial relationship/i);
++});
++
++test('detail scene-cut hints remain non-mandatory re-evaluation points', () => {
++  const guidance = `${detailSemanticFramingGuidance()}${detailSceneCutGuidance([4.2], 10)}`;
++  assert.match(guidance, /Candidate visual shot boundaries.*4\.2/);
++  assert.match(guidance, /hints, not mandatory cuts/i);
++  assert.match(guidance, /do not imply FILL, a mode change, or a mandatory split/i);
++});
++
+ test('detail framing preserves different semantic contain reasons', () => {

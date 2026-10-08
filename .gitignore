@@ -1,0 +1,29 @@
+node_modules/
+.local-ai/
+dist/
+uploads/
+output/
+temp/
+tmp/
+cache/
+*.log
+.env
+.env.*
+!.env.example
+__pycache__/
+.venv/
+.venv-diar/
+.venv-tiktokapi/
+.tiktok-session/
+.tiktok-api-session/
+.youtube-bin/
+.codex-log/
+
+# Local detector weights (YuNet face model, later a person model). Binary blobs,
+# downloadable, never committed: the tracker logs the exact file it loaded.
+models/*.onnx
+models/*.pt
+
+# Handoff snapshots are generated from the repo itself, so tracking one would just
+# duplicate the source (and go stale the next commit). Regenerate when sharing.
+GhostForge-handoff-*.zip

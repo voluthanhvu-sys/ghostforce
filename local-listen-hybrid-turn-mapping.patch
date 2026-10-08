@@ -1,0 +1,334 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -11,6 +11,7 @@ import { runProcess } from './server/process.js';
+ import { jobs, subscribeJob, jobSignal, abortJob, ensureAbort } from './server/jobs.js';
+ import { createSaveDirStore } from './server/save-dir.js';
+ import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, sourceTimeForTrackPoint, normalizeFrameMode, stitchFrames, clamp01, parseFraming, parseSpeakerTrack, snapSpeakerTrack, clampPlan, parseGeminiPlan } from './server/editor-plan.js';
++import { mapDiarizationEvidence, fallbackSpeechForAmbiguousTurns } from './server/local-listen-map.js';
+ 
+ const __dirname = path.dirname(fileURLToPath(import.meta.url));
+ const app = express();
+@@ -3122,62 +3123,11 @@ const mapDiarizationToPlan = (turns, plan, onDiagnostic) => {
+         return pieces.map((p) => ({ start: Number(p.start), end: Number(p.end) }))
+             .filter((p) => Number.isFinite(p.start) && Number.isFinite(p.end) && p.end > p.start);
+     });
+-    const byCluster = new Map();
+-    for (const turn of turns) {
+-        if (!byCluster.has(turn.speakerId)) byCluster.set(turn.speakerId, []);
+-        byCluster.get(turn.speakerId).push(turn);
+-    }
+-    const names = new Map();
+-    let diagnosticCount = 0;
+-    for (const [speakerId, clusterTurns] of byCluster) {
+-        const total = clusterTurns.reduce((sum, turn) => sum + ranges.reduce((inside, range) => (
+-            inside + Math.max(0, Math.min(turn.end, range.end) - Math.max(turn.start, range.start))
+-        ), 0), 0);
+-        if (total < 0.35) continue;
+-        const scores = new Map();
+-        for (const turn of clusterTurns) {
+-            for (const hint of intervals) {
+-                const overlap = Math.max(0, Math.min(turn.end, hint.end) - Math.max(turn.start, hint.start));
+-                if (overlap <= 0) continue;
+-                scores.set(hint.who, (scores.get(hint.who) || 0) + overlap);
+-            }
+-        }
+-        const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1]);
+-        const evidence = ranked.reduce((sum, x) => sum + x[1], 0);
+-        const winner = ranked[0];
+-        const second = ranked[1]?.[1] || 0;
+-        const clear = winner
+-            && evidence >= Math.max(0.8, total * 0.35)
+-            && evidence / Math.max(0.01, total) >= 0.45
+-            && winner[1] / evidence >= 0.70
+-            && winner[1] - second >= Math.max(0.35, evidence * 0.20);
+-        if (diagnosticCount < 8 && typeof onDiagnostic === 'function') {
+-            const coverage = evidence / Math.max(0.01, total);
+-            const topShare = winner ? winner[1] / evidence : 0;
+-            const margin = winner ? winner[1] - second : 0;
+-            const requiredMargin = Math.max(0.35, evidence * 0.20);
+-            const topName = String(winner?.[0] || 'none').replace(/\s+/g, ' ').trim();
+-            const secondName = String(ranked[1]?.[0] || 'none').replace(/\s+/g, ' ').trim();
+-            const ratio = (value) => Number(value).toFixed(2).replace(/^0/, '');
+-            try {
+-                onDiagnostic(
+-                    `[EDIT] Local Listen map ${speakerId}: total=${total.toFixed(2)} evidence=${evidence.toFixed(2)} coverage=${ratio(coverage)} `
+-                    + `${topName}=${(winner?.[1] || 0).toFixed(2)} ${secondName}=${second.toFixed(2)} `
+-                    + `share=${ratio(topShare)} margin=${margin.toFixed(2)} needShare=.70 needMargin=${requiredMargin.toFixed(2)} `
+-                    + `-> ${clear ? `mapped ${winner[0]}` : 'ambiguous'}`,
+-                );
+-            } catch { /* diagnostics must not affect mapping */ }
+-            diagnosticCount += 1;
+-        }
+-        if (!clear) return { ok: false, reason: `ambiguous PLAN identity for ${speakerId}` };
+-        names.set(speakerId, winner[0]);
+-    }
+-    if (!names.size) return { ok: false, reason: 'no diarization clusters overlap PLAN output' };
+-    return { ok: true, names, intervals };
++    return { ...mapDiarizationEvidence(turns, intervals, ranges, onDiagnostic), intervals };
+ };
+ 
+-const mergeDiarizationWords = (turns, words, mapped) => turns.filter((turn) => mapped.names.has(turn.speakerId)).map((turn) => {
+-    const who = mapped.names.get(turn.speakerId);
++const mergeDiarizationWords = (words, mapped) => mapped.mappedTurns.map((turn) => {
++    const who = turn.who;
+     const mid = (turn.start + turn.end) / 2;
+     const text = words
+         .filter((w) => {
+@@ -3493,9 +3443,10 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                         (message) => send('log', { message }),
+                     );
+                     if (!localMapping.ok) throw new Error(localMapping.reason);
+-                    const clusters = new Set(localTurns.map((x) => x.speakerId)).size;
+-                    const characters = new Set(localMapping.names.values()).size;
+-                    send('log', { message: `[EDIT] Local Listen: ${clusters} speaker clusters / ${characters} mapped characters` });
++                    send('log', {
++                        message: `[EDIT] Local Listen: ${localMapping.globalMappedClusters} global-mapped clusters · `
++                            + `${localMapping.turnMappedTurns} turn-mapped turns · ${localMapping.ambiguousTurns.length} ambiguous turns`,
++                    });
+                 } catch (localErr) {
+                     const message = localErr instanceof Error ? localErr.message : String(localErr);
+                     if (/cancell/i.test(message) || job.cancelled) throw localErr;
+@@ -3515,7 +3466,16 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                         (m) => send('log', { message: m }),
+                     );
+                     if (localTurns && localMapping && words.length) {
+-                        speechAll = mergeDiarizationWords(localTurns, words, localMapping);
++                        const localSpeech = mergeDiarizationWords(words, localMapping);
++                        const unresolvedFallback = fallbackSpeechForAmbiguousTurns(
++                            fallbackSpeech,
++                            localMapping.ambiguousTurns,
++                            localMapping.mappedTurns,
++                        );
++                        speechAll = [
++                            ...localSpeech,
++                            ...snapLinesToWords(unresolvedFallback, words),
++                        ].sort((a, b) => a.t - b.t);
+                     } else if (words.length && speechAll.length) {
+                         speechAll = snapLinesToWords(speechAll, words);
+                     } else if (localTurns && localMapping && !words.length) {
+diff --git a/server/local-listen-map.js b/server/local-listen-map.js
+new file mode 100644
+--- /dev/null
++++ b/server/local-listen-map.js
+@@ -0,0 +1,153 @@
++const overlapDuration = (a, b) => Math.max(0, Math.min(a.end, b.end) - Math.max(a.start, b.start));
++
++const scoreTurns = (turns, intervals, ranges) => {
++  const total = turns.reduce((sum, turn) => sum + ranges.reduce((inside, range) => (
++    inside + overlapDuration(turn, range)
++  ), 0), 0);
++  const scores = new Map();
++  for (const turn of turns) {
++    for (const hint of intervals) {
++      const overlap = overlapDuration(turn, hint);
++      if (overlap <= 0) continue;
++      scores.set(hint.who, (scores.get(hint.who) || 0) + overlap);
++    }
++  }
++  const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1]);
++  const evidence = ranked.reduce((sum, x) => sum + x[1], 0);
++  const winner = ranked[0];
++  const second = ranked[1]?.[1] || 0;
++  const clear = winner
++    && evidence >= Math.max(0.8, total * 0.35)
++    && evidence / Math.max(0.01, total) >= 0.45
++    && winner[1] / evidence >= 0.70
++    && winner[1] - second >= Math.max(0.35, evidence * 0.20);
++  return { total, ranked, evidence, winner, second, clear };
++};
++
++const diagnosticLine = (kind, speakerId, scored, turn) => {
++  const { total, ranked, evidence, winner, second, clear } = scored;
++  const coverage = evidence / Math.max(0.01, total);
++  const topShare = winner ? winner[1] / evidence : 0;
++  const margin = winner ? winner[1] - second : 0;
++  const requiredMargin = Math.max(0.35, evidence * 0.20);
++  const topName = String(winner?.[0] || 'none').replace(/\s+/g, ' ').trim();
++  const secondName = String(ranked[1]?.[0] || 'none').replace(/\s+/g, ' ').trim();
++  const ratio = (value) => Number(value).toFixed(2).replace(/^0/, '');
++  const at = turn ? ` ${turn.start.toFixed(2)}-${turn.end.toFixed(2)}` : '';
++  return `[EDIT] Local Listen ${kind} ${speakerId}${at}: total=${total.toFixed(2)} evidence=${evidence.toFixed(2)} coverage=${ratio(coverage)} `
++    + `${topName}=${(winner?.[1] || 0).toFixed(2)} ${secondName}=${second.toFixed(2)} `
++    + `share=${ratio(topShare)} margin=${margin.toFixed(2)} needShare=.70 needMargin=${requiredMargin.toFixed(2)} `
++    + `-> ${clear ? `${kind === 'map' ? 'mapped ' : ''}${winner[0]}` : 'ambiguous'}`;
++};
++
++export const mapDiarizationEvidence = (turns, intervals, ranges, onDiagnostic) => {
++  const byCluster = new Map();
++  for (const turn of turns) {
++    if (!byCluster.has(turn.speakerId)) byCluster.set(turn.speakerId, []);
++    byCluster.get(turn.speakerId).push(turn);
++  }
++  const names = new Map();
++  const mappedTurns = [];
++  const ambiguousTurns = [];
++  let globalMappedClusters = 0;
++  let turnMappedTurns = 0;
++  let globalDiagnosticCount = 0;
++  let turnDiagnosticCount = 0;
++  let firstAmbiguousSpeaker = '';
++  const emit = (line) => {
++    try { onDiagnostic?.(line); } catch { /* diagnostics must not affect mapping */ }
++  };
++
++  for (const [speakerId, clusterTurns] of byCluster) {
++    const globalScore = scoreTurns(clusterTurns, intervals, ranges);
++    if (globalScore.total < 0.35) continue;
++    if (globalDiagnosticCount < 8) {
++      emit(diagnosticLine('map', speakerId, globalScore));
++      globalDiagnosticCount += 1;
++    }
++    if (globalScore.clear) {
++      names.set(speakerId, globalScore.winner[0]);
++      globalMappedClusters += 1;
++      for (const turn of clusterTurns) mappedTurns.push({ ...turn, who: globalScore.winner[0] });
++      continue;
++    }
++
++    firstAmbiguousSpeaker ||= speakerId;
++    for (const turn of clusterTurns) {
++      const turnScore = scoreTurns([turn], intervals, ranges);
++      if (turnScore.total <= 0) continue;
++      if (turnDiagnosticCount < 12) {
++        emit(diagnosticLine('turn', speakerId, turnScore, turn));
++        turnDiagnosticCount += 1;
++      }
++      if (turnScore.total >= 0.35 && turnScore.clear) {
++        mappedTurns.push({ ...turn, who: turnScore.winner[0] });
++        turnMappedTurns += 1;
++      } else {
++        ambiguousTurns.push(turn);
++      }
++    }
++  }
++
++  if (!mappedTurns.length) {
++    return {
++      ok: false,
++      reason: firstAmbiguousSpeaker
++        ? `ambiguous PLAN identity for ${firstAmbiguousSpeaker}`
++        : 'no diarization clusters overlap PLAN output',
++      names,
++      mappedTurns,
++      ambiguousTurns,
++      globalMappedClusters,
++      turnMappedTurns,
++    };
++  }
++  return { ok: true, names, mappedTurns, ambiguousTurns, globalMappedClusters, turnMappedTurns };
++};
++
++const mergeRanges = (ranges) => {
++  const sorted = ranges
++    .filter((x) => Number.isFinite(x.start) && Number.isFinite(x.end) && x.end > x.start)
++    .sort((a, b) => a.start - b.start);
++  const out = [];
++  for (const range of sorted) {
++    const last = out[out.length - 1];
++    if (last && range.start <= last.end) last.end = Math.max(last.end, range.end);
++    else out.push({ start: range.start, end: range.end });
++  }
++  return out;
++};
++
++const subtractRanges = (start, end, exclusions) => {
++  let parts = [{ start, end }];
++  for (const exclusion of exclusions) {
++    const next = [];
++    for (const part of parts) {
++      if (exclusion.end <= part.start || exclusion.start >= part.end) {
++        next.push(part);
++        continue;
++      }
++      if (exclusion.start > part.start) next.push({ start: part.start, end: exclusion.start });
++      if (exclusion.end < part.end) next.push({ start: exclusion.end, end: part.end });
++    }
++    parts = next;
++  }
++  return parts.filter((x) => x.end > x.start);
++};
++
++export const fallbackSpeechForAmbiguousTurns = (fallbackSpeech, ambiguousTurns, mappedTurns) => {
++  const unresolved = mergeRanges(ambiguousTurns.map((x) => ({ start: x.start, end: x.end })));
++  const confident = mergeRanges(mappedTurns.map((x) => ({ start: x.start, end: x.end })));
++  const out = [];
++  for (const line of fallbackSpeech) {
++    for (const range of unresolved) {
++      const start = Math.max(line.t, range.start);
++      const end = Math.min(line.end, range.end);
++      if (end <= start) continue;
++      for (const part of subtractRanges(start, end, confident)) {
++        out.push({ ...line, t: part.start, end: part.end });
++      }
++    }
++  }
++  return out.sort((a, b) => a.t - b.t);
++};
+diff --git a/tests/local-listen-map.test.js b/tests/local-listen-map.test.js
+new file mode 100644
+--- /dev/null
++++ b/tests/local-listen-map.test.js
+@@ -0,0 +1,61 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { mapDiarizationEvidence, fallbackSpeechForAmbiguousTurns } from '../server/local-listen-map.js';
++
++const range = [{ start: 0, end: 20 }];
++
++test('globally clear diarization cluster keeps one global identity', () => {
++  const turns = [
++    { start: 0, end: 2, speakerId: 'SPEAKER_00' },
++    { start: 3, end: 5, speakerId: 'SPEAKER_00' },
++  ];
++  const intervals = [{ start: 0, end: 5, who: 'Cody' }];
++  const mapped = mapDiarizationEvidence(turns, intervals, range);
++  assert.equal(mapped.ok, true);
++  assert.equal(mapped.globalMappedClusters, 1);
++  assert.equal(mapped.turnMappedTurns, 0);
++  assert.deepEqual(mapped.mappedTurns.map((x) => x.who), ['Cody', 'Cody']);
++});
++
++test('globally ambiguous cluster maps locally clear turns to different identities', () => {
++  const turns = [
++    { start: 0, end: 2, speakerId: 'SPEAKER_00' },
++    { start: 2, end: 4, speakerId: 'SPEAKER_00' },
++  ];
++  const intervals = [
++    { start: 0, end: 2, who: 'Cody' },
++    { start: 2, end: 4, who: 'Junior' },
++  ];
++  const mapped = mapDiarizationEvidence(turns, intervals, range);
++  assert.equal(mapped.ok, true);
++  assert.equal(mapped.globalMappedClusters, 0);
++  assert.equal(mapped.turnMappedTurns, 2);
++  assert.deepEqual(mapped.mappedTurns.map((x) => x.who), ['Cody', 'Junior']);
++});
++
++test('locally ambiguous turn remains unresolved while clear turns are retained', () => {
++  const turns = [
++    { start: 0, end: 2, speakerId: 'SPEAKER_00' },
++    { start: 2, end: 4, speakerId: 'SPEAKER_00' },
++    { start: 4, end: 6, speakerId: 'SPEAKER_00' },
++  ];
++  const intervals = [
++    { start: 0, end: 2, who: 'Cody' },
++    { start: 2, end: 4, who: 'Junior' },
++    { start: 4, end: 5, who: 'Cody' },
++    { start: 5, end: 6, who: 'Junior' },
++  ];
++  const mapped = mapDiarizationEvidence(turns, intervals, range);
++  assert.equal(mapped.ok, true);
++  assert.equal(mapped.turnMappedTurns, 2);
++  assert.equal(mapped.ambiguousTurns.length, 1);
++  assert.deepEqual(mapped.ambiguousTurns[0], turns[2]);
++});
++
++test('fallback speech is restricted to unresolved time and excludes local mapped ranges', () => {
++  const fallback = [{ t: 1, end: 4, who: 'Junior', text: 'fallback' }];
++  const ambiguous = [{ start: 2, end: 4, speakerId: 'SPEAKER_00' }];
++  const mapped = [{ start: 0, end: 3, speakerId: 'SPEAKER_00', who: 'Cody' }];
++  const result = fallbackSpeechForAmbiguousTurns(fallback, ambiguous, mapped);
++  assert.deepEqual(result.map((x) => [x.t, x.end, x.who]), [[3, 4, 'Junior']]);
++});
+

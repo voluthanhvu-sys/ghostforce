@@ -1,0 +1,48 @@
+PLAN 94.89s ROOT CAUSE:
+The plan timing starts inside vertexGeneratePlan() after proxy shrink, base64 read, request-body construction, and model selection. It ends in the function's finally block after every location/attempt either returns or fails. It therefore includes HTTP request/response waiting, Vertex inference, response JSON decoding, candidate-text extraction, parseGeminiPlan(), retries, auth refresh on retry, and backoff. It excludes initial ADC auth and proxy shrink/base64 setup.
+
+For a 60-second test, waitPulse estimates 50 seconds (max(50s, duration * 0.5)). It rounds elapsed/50s to a watch percentage and logs only each additional 5%. Around 47s it logs 95%. It then caps at 99%, which is less than the next 100% logging threshold, so it continues running but emits no further heartbeat log until the 94.89s request finishes. The heartbeat does not measure or bound the request.
+
+Source alone cannot assign the additional ~48s to a particular remote phase or prove what occurred in TEST B. parseGeminiPlan() and a 79-point track have no source-side timing and no evidence they account for a material part of 94.89s; the measured interval is dominated by the remote fetch/inference wait unless retry/backoff occurred.
+
+EXTRA API REQUEST POSSIBLE:
+YES. vertexGeneratePlan() tries up to three requests per location and can then try global, for up to six whole-video requests. Retry attempts at the same location log "Vertex retry 2/3" or "3/3". Entering global starts attempt 1 without an explicit location-fallback log.
+
+PLAN RETRY/JSON WASTE FOUND:
+YES. A successful HTTP response with empty candidate text retries. A successful HTTP response whose candidate text causes parseGeminiPlan() to throw (missing/invalid JSON, or no usable segments) is caught by the generic catch, logged only as the parser error, then retried with the full request. There is no two-invalid-JSON cap equivalent to vertexJsonVideo(). Quota/server/network retry paths also continue. Retry adds ADC refresh and 2 * attempt seconds backoff.
+
+SAFE PLAN OPTIMIZATION OPPORTUNITY:
+Instrument/log an explicit plan parse-invalid classification and location transition before deciding any retry-policy change. The smallest behavior-preserving observation patch would add logs only; no source evidence supports reducing normal plan inference time without changing retry behavior or remote service behavior.
+
+SPEAKER LABEL ROOT CAUSE:
+Confirmed data-loss/override path:
+1. vertexJsonVideo() returns lines; parseSpeechLines() preserves who (only trim/slice to 28 chars).
+2. snapLinesToWords() changes only t; it preserves who, end, cx, and cy.
+3. speechForSegment() preserves who/cx/cy while converting source times to cut-relative times.
+4. applySpeechToWindows() writes STT identity into both who and why for each speech-derived fill window.
+5. splitFillOnSpeaker() then recreates each fill window using only a, b, mode, why, cx, cy. It omits the STT who field. Its why and cx come from PLAN track: initial who is inside[0].who || w.why, then output sets why to that value and cx to the PLAN-track coordinate.
+6. mixFrameClip() reads named = w.who || w.why. Since splitFillOnSpeaker() removed who, named becomes PLAN-track why. This explains dedicated STT Brooklyn/Jeffy being logged as Marvin or Brooklyn Guy when those are PLAN-track labels at the same window.
+
+"Brooklyn" and "Brooklyn Guy" are not normalized to a canonical label. cxForWhoAt() uses lowercase exact-or-substring matching, so they can be treated as the same identity for track lookup. "Marvin" does not match "Brooklyn"; seeing Marvin means the split output selected a Marvin PLAN-track point, not that Google STT changed Brooklyn to Marvin.
+
+"contain" can become the displayed named value if the selected PLAN track point has who="contain", or if that point has no who and the pre-existing frame why is "contain". parseSpeakerTrack() accepts any nonempty string; no semantic validation rejects framing modes as speaker names.
+
+CAN WRONG LABEL CHANGE ACTUAL CROP:
+YES. After split, the PLAN-derived label and cx are the primary crop inputs. mixFrameClip() asks cxForWhoAt(named, t, track) first, then uses the PLAN-derived line cx, then seat fallback. RGB refinement only adjusts cx by snapping to a visual peak near that hint; it does not change who. It can therefore preserve or partially correct a wrong target, but it cannot restore the dedicated-STT identity that split discarded.
+
+FUNCTIONS INVOLVED:
+vertexGeneratePlan(), parseGeminiPlan(), parseSpeechLines(), snapLinesToWords(), speechForSegment(), applySpeechToWindows(), splitFillOnSpeaker(), buildSeatLock(), cxForWhoAt(), hintCxAt(), sampleTalkerX(), mixFrameClip().
+
+ACCURACY RISK:
+HIGH. The dedicated speaker result can be replaced by PLAN-track identity and coordinate before the final crop hint is chosen. RGB refinement changes cx only and is not speaker-aware.
+
+CLASSIFICATION:
+- Confirmed bug: splitFillOnSpeaker() drops w.who from speech-derived windows and replaces why/cx from PLAN track.
+- Intentional fallback: plan track, seat lock, and RGB peak snapping are fallback/verification mechanisms when direct line position is unavailable.
+- Ambiguous behavior: whether a particular TEST B Marvin/contain value came from malformed PLAN track data or frame why cannot be proven without that plan response/log.
+
+RECOMMENDED NEXT PATCH:
+Smallest accuracy patch: preserve speech-derived who (and its cx/cy when present) through splitFillOnSpeaker(), while still allowing PLAN track to split timing/verify transitions. This should be validated with a real clip containing Brooklyn, Jeffy, and Brooklyn Guy before changing retry policy. Separately, any plan JSON retry cap should mirror the existing vertexJsonVideo() protection only after a dedicated retry-policy review.
+
+VALIDATION:
+Source inspection only; no tests run and no source code changed.

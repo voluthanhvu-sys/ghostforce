@@ -1,0 +1,35 @@
+BAT NVIDIA NVENC CHO GHOSTFORGE (Lenovo RTX 3050 Laptop)
+========================================================
+
+Loi "Function not implemented" = FFmpeg THAY nvenc nhung DRIVER khong mo duoc.
+App khong the "bat RTX" neu Windows chua giao ffmpeg cho GPU NVIDIA.
+
+LAM LAN LUOT:
+
+1) Cap nhat driver NVIDIA
+   - Mo GeForce Experience hoac https://www.nvidia.com/Download/index.aspx
+   - GPU: RTX 3050 Laptop. Cai Game Ready, restart.
+
+2) Bat GPU NVIDIA cho ffmpeg.exe (quan trong nhat)
+   Windows 11:
+   Settings > System > Display > Graphics
+   - Browse > them dung file ffmpeg.exe (lenh where ffmpeg se chi duong)
+   - Options > High performance (NVIDIA)
+   Them ca node.exe neu co.
+
+   NVIDIA Control Panel:
+   Manage 3D Settings > Program Settings
+   - Add ffmpeg.exe
+   - Preferred graphics processor = High-performance NVIDIA processor
+   Apply.
+
+3) (Lenovo) Neu co Lenovo Vantage / GPU mode:
+   Discrete / NVIDIA only, khong Hybrid tiet kiem pin. Restart.
+
+4) Chay enable-nvidia.bat trong thu muc GhostForge.
+   Thay "OK: NVENC chay duoc" thi mo app, bam "Test NVIDIA again".
+   Log phai: NVIDIA yes. Encoder chon NVIDIA NVENC.
+
+Neu van THAT BAI: FFmpeg 8 lech SDK. Tai ban FULL:
+   https://www.gyan.dev/ffmpeg/builds/  (ffmpeg-git-full.7z)
+   Giai nen, copy ffmpeg.exe vao PATH (thay ban cu), chay lai buoc 2 roi 4.

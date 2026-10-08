@@ -1,0 +1,203 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -10,7 +10,7 @@ import { fileURLToPath } from 'url';
+ import { runProcess } from './server/process.js';
+ import { jobs, subscribeJob, jobSignal, abortJob, ensureAbort } from './server/jobs.js';
+ import { createSaveDirStore } from './server/save-dir.js';
+-import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, isSpeakerIdentity, resolveSpeakerWho, validSpeakerTrackPoints, parseSpeechLines, sourceTimeForTrackPoint, normalizeFrameMode, stitchFrames, clamp01, parseFraming, parseSpeakerTrack, snapSpeakerTrack, clampPlan, parseGeminiPlan } from './server/editor-plan.js';
++import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, isSpeakerIdentity, resolveSpeakerWho, validSpeakerTrackPoints, shouldUsePerPartDetailPlan, mergeSegmentDetail, parseSpeechLines, sourceTimeForTrackPoint, normalizeFrameMode, stitchFrames, clamp01, parseFraming, parseSpeakerTrack, snapSpeakerTrack, clampPlan, parseGeminiPlan } from './server/editor-plan.js';
+ import { mapDiarizationEvidence, fallbackSpeechForAmbiguousTurns } from './server/local-listen-map.js';
+ import { runGoogleSttChunkWithRetry } from './server/google-stt-retry.js';
+ 
+@@ -2712,7 +2712,7 @@ async function shrinkProxyForVertex(srcPath, job, onLog) {
+     return { filePath: current, extras, mb: fs.statSync(current).size / 1024 / 1024 };
+ }
+ 
+-async function vertexGeneratePlan(auth, model, videoPath, userPrompt, duration, maxParts, minSec, job, onLog, autoParts = false, tiktokMix = false, testClip = false) {
++async function vertexGeneratePlan(auth, model, videoPath, userPrompt, duration, maxParts, minSec, job, onLog, autoParts = false, tiktokMix = false, testClip = false, timingLabel = 'plan AI') {
+     const shrunk = await shrinkProxyForVertex(videoPath, job, onLog);
+     const filePath = shrunk.filePath;
+     if (onLog) onLog(`[EDIT] Vertex proxy ${shrunk.mb.toFixed(1)}MB`);
+@@ -2788,7 +2788,7 @@ async function vertexGeneratePlan(auth, model, videoPath, userPrompt, duration,
+     }
+     throw new Error(lastErr || 'Vertex generate failed');
+     } finally {
+-        if (onLog) onLog(`[EDIT TIMING] plan AI: ${((Date.now() - aiStartedAt) / 1000).toFixed(2)}s`);
++        if (onLog) onLog(`[EDIT TIMING] ${timingLabel}: ${((Date.now() - aiStartedAt) / 1000).toFixed(2)}s`);
+     }
+ }
+ 
+@@ -3431,6 +3431,90 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+             });
+         }
+ 
++        if (shouldUsePerPartDetailPlan({ mode, tiktokMix, testSec, segmentCount: plan?.segments?.length })) {
++            const lastDetail = partTo > 0 ? partTo : plan.segments.length;
++            const detailTargets = plan.segments
++                .map((seg, index) => ({ seg, index }))
++                .filter(({ index }) => index + 1 >= partFrom && index + 1 <= lastDetail);
++            let detailEnriched = 0;
++            let detailFallback = 0;
++            for (let detailIndex = 0; detailIndex < detailTargets.length; detailIndex++) {
++                const { seg, index } = detailTargets[detailIndex];
++                const ordinal = `${index + 1}/${plan.segments.length}`;
++                const detailMedia = path.join(uploadsDir, `${jobId}_detail_${index + 1}.mp4`);
++                const detailProxy = path.join(uploadsDir, `${jobId}_detail_${index + 1}_gemini.mp4`);
++                try {
++                    await cutEditClip(job.inputPath, detailMedia, seg, job, false);
++                    const detailProbe = await probeMedia(detailMedia);
++                    const detailDuration = Number(detailProbe.durationSec) || Number(seg.dur) || 0;
++                    const pieceCount = Array.isArray(seg.pieces) && seg.pieces.length ? seg.pieces.length : 1;
++                    send('log', { message: `[EDIT] Detail PLAN ${ordinal}: ${pieceCount} piece${pieceCount === 1 ? '' : 's'} · local ${detailDuration.toFixed(1)}s` });
++
++                    const detailProxyStartedAt = Date.now();
++                    try {
++                        await runEditEncode([
++                            '-y', '-i', detailMedia,
++                            '-vf', "scale='min(854,iw)':-2",
++                            '-r', '12',
++                        ], [
++                            '-c:a', 'aac', '-b:a', '64k', '-ac', '1',
++                            '-movflags', '+faststart',
++                            detailProxy,
++                        ], job, 32, true);
++                    } finally {
++                        logEditTiming(`detail proxy ${ordinal}`, detailProxyStartedAt);
++                    }
++
++                    const detailMinSec = Math.max(12, Math.min(25, detailDuration * 0.35));
++                    let detailPlan;
++                    if (apiKey) {
++                        const uploaded = await geminiUploadVideo(apiKey, detailProxy, `detail-${index + 1}`);
++                        try {
++                            const detailAiStartedAt = Date.now();
++                            try {
++                                detailPlan = await geminiGeneratePlan(
++                                    apiKey, model, uploaded.uri, userPrompt,
++                                    detailDuration, 1, detailMinSec, false, true, true,
++                                );
++                            } finally {
++                                logEditTiming(`detail AI ${ordinal}`, detailAiStartedAt);
++                            }
++                        } finally {
++                            await geminiDeleteFile(apiKey, uploaded.name);
++                        }
++                    } else {
++                        const auth = await getAdcAuth();
++                        detailPlan = await vertexGeneratePlan(
++                            auth, model, detailProxy, userPrompt,
++                            detailDuration, 1, detailMinSec, job,
++                            (m) => send('log', { message: m }),
++                            false, true, true, `detail AI ${ordinal}`,
++                        );
++                    }
++                    const detailSeg = detailPlan?.segments?.[0];
++                    if (!detailSeg?.frames?.length || !detailSeg?.track?.length) {
++                        throw new Error('detail PLAN missing framing or speaker track');
++                    }
++                    plan.segments[index] = mergeSegmentDetail(seg, detailSeg);
++                    detailEnriched += 1;
++                    send('log', { message: `[EDIT] Detail PLAN ${ordinal}: ${detailSeg.frames.length} framing windows · ${detailSeg.track.length} speaker pts` });
++                } catch (detailErr) {
++                    const message = detailErr instanceof Error ? detailErr.message : String(detailErr);
++                    if (/cancell/i.test(message) || job.cancelled) throw detailErr;
++                    detailFallback += 1;
++                    send('log', { message: `[EDIT] Detail PLAN ${ordinal} failed — using global PLAN fallback (${message})`.slice(0, 240) });
++                } finally {
++                    try { fs.unlinkSync(detailMedia); } catch { /* ignore */ }
++                    try { fs.unlinkSync(detailProxy); } catch { /* ignore */ }
++                    try { fs.unlinkSync(detailProxy.replace(/\.mp4$/i, '_small.mp4')); } catch { /* ignore */ }
++                    for (let shrinkIndex = 1; shrinkIndex <= 6; shrinkIndex++) {
++                        try { fs.unlinkSync(detailProxy.replace(/\.mp4$/i, `_s${shrinkIndex}.mp4`)); } catch { /* ignore */ }
++                    }
++                }
++            }
++            send('log', { message: `[EDIT] Detail PLAN complete: ${detailEnriched}/${detailTargets.length} enriched · ${detailFallback} fallback` });
++        }
++
+         if (tiktokMix && mode === 'ai') {
+             if (process.env.GHOSTFORGE_VERTEX_LISTEN !== '1') {
+                 send('log', { message: '[EDIT] Local Listen: pyannote diarization' });
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -75,6 +75,23 @@ export const resolveSpeakerWho = ({ windowWho, trackWho } = {}) => {
+ export const validSpeakerTrackPoints = (track) => (Array.isArray(track) ? track : [])
+     .filter((point) => point && Number.isFinite(point.t) && isSpeakerIdentity(point.who));
+ 
++export const shouldUsePerPartDetailPlan = ({ mode, tiktokMix, testSec, segmentCount } = {}) => (
++    mode === 'ai' && Boolean(tiktokMix) && Number(testSec) <= 0 && Number(segmentCount) > 1
++);
++
++export const mergeSegmentDetail = (globalSegment, detailSegment) => {
++    if (!globalSegment || !detailSegment) return globalSegment;
++    return {
++        ...globalSegment,
++        frames: Array.isArray(detailSegment.frames) && detailSegment.frames.length
++            ? detailSegment.frames
++            : globalSegment.frames,
++        track: Array.isArray(detailSegment.track) && detailSegment.track.length
++            ? detailSegment.track
++            : globalSegment.track,
++    };
++};
++
+ export const parseSpeechLines = (parsed, duration) => {
+     const arr = (parsed && (parsed.lines || parsed.speech || parsed.utterances)) || [];
+     const dur = Math.max(0.2, Number(duration) || 0);
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan, sourceTimeForTrackPoint, isSpeakerIdentity, resolveSpeakerWho, parseSpeechLines } from '../server/editor-plan.js';
++import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan, sourceTimeForTrackPoint, shouldUsePerPartDetailPlan, mergeSegmentDetail, isSpeakerIdentity, resolveSpeakerWho, parseSpeechLines } from '../server/editor-plan.js';
+ 
+ test('evenSplitPlan creates contiguous bounded segments', () => {
+   const segs = evenSplitPlan(360, 3, 60, false);
+@@ -35,6 +35,43 @@ test('sourceTimeForTrackPoint maps concatenated time into the second piece', ()
+   assert.equal(sourceTimeForTrackPoint(pieces, 7, 10), 42);
+ });
+ 
++test('per-part detail replaces only local frames and track', () => {
++  const global = {
++    start: 10,
++    end: 55,
++    title: 'Global title',
++    titleVi: 'Tiêu đề',
++    pieces: [{ start: 10, end: 20 }, { start: 40, end: 55 }],
++    frames: [{ a: 0, b: 25, mode: 'contain' }],
++    track: [{ t: 0, who: 'Old', cx: 0.2 }],
++  };
++  const detail = {
++    frames: [{ a: 0, b: 5, mode: 'fill' }],
++    track: [{ t: 12, who: 'Junior', cx: 0.7 }],
++  };
++  const merged = mergeSegmentDetail(global, detail);
++  assert.deepEqual(merged.frames, detail.frames);
++  assert.deepEqual(merged.track, detail.track);
++  assert.equal(merged.track[0].t, 12);
++  assert.equal(merged.start, 10);
++  assert.equal(merged.end, 55);
++  assert.equal(merged.title, 'Global title');
++  assert.equal(merged.titleVi, 'Tiêu đề');
++  assert.deepEqual(merged.pieces, global.pieces);
++  assert.equal(sourceTimeForTrackPoint(merged.pieces, merged.track[0].t, merged.start), 42);
++});
++
++test('per-part detail failure preserves global framing and track', () => {
++  const global = { frames: [{ mode: 'contain' }], track: [{ t: 1, who: 'Junior' }] };
++  assert.equal(mergeSegmentDetail(global, null), global);
++});
++
++test('production detail enrichment excludes TEST and single-part paths', () => {
++  assert.equal(shouldUsePerPartDetailPlan({ mode: 'ai', tiktokMix: true, testSec: 0, segmentCount: 6 }), true);
++  assert.equal(shouldUsePerPartDetailPlan({ mode: 'ai', tiktokMix: true, testSec: 60, segmentCount: 1 }), false);
++  assert.equal(shouldUsePerPartDetailPlan({ mode: 'ai', tiktokMix: true, testSec: 0, segmentCount: 1 }), false);
++});
++
+ test('speaker identity accepts normal aliases and rejects narrative text', () => {
+   for (const name of ['Brooklyn Guy', 'Chef Pee Pee', "Cody's Dad", 'Brooklyn-Guy', 'Mr. Goodman']) {
+     assert.equal(isSpeakerIdentity(name), true, name);

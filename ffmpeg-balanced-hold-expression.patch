@@ -1,0 +1,69 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+index 3167d20..3e9764a 100644
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -14,6 +14,7 @@ import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, isSpe
+ import { mapDiarizationEvidence, fallbackSpeechForAmbiguousTurns } from './server/local-listen-map.js';
+ import { runGoogleSttChunkWithRetry } from './server/google-stt-retry.js';
+ import { firstMeaningfulFfmpegError } from './server/ffmpeg-diagnostics.js';
++import { balancedSum } from './server/ffmpeg-expressions.js';
+ 
+ const __dirname = path.dirname(fileURLToPath(import.meta.url));
+ const app = express();
+@@ -4263,7 +4264,7 @@ const ffmpegHoldSnapExpr = (pts, axis, srcW, srcH, cropW, cropH) => {
+     }
+     const last = pts[pts.length - 1];
+     parts.push('gte(t\\,' + last.t.toFixed(3) + ')*' + pixelOf(last, axis, srcW, srcH, cropW, cropH).toFixed(2));
+-    return 'trunc((' + parts.join('+') + ')/2)*2';
++    return 'trunc((' + balancedSum(parts) + ')/2)*2';
+ };
+ 
+ const thinTrack = (pts, maxN) => {
+diff --git a/server/ffmpeg-expressions.js b/server/ffmpeg-expressions.js
+new file mode 100644
+index 0000000..7c83fe2
+--- /dev/null
++++ b/server/ffmpeg-expressions.js
+@@ -0,0 +1,6 @@
++export const balancedSum = (parts) => {
++    if (!Array.isArray(parts) || !parts.length) return '0';
++    if (parts.length === 1) return String(parts[0]);
++    const middle = Math.floor(parts.length / 2);
++    return `(${balancedSum(parts.slice(0, middle))}+${balancedSum(parts.slice(middle))})`;
++};
+diff --git a/tests/ffmpeg-expressions.test.js b/tests/ffmpeg-expressions.test.js
+new file mode 100644
+index 0000000..47fd166
+--- /dev/null
++++ b/tests/ffmpeg-expressions.test.js
+@@ -0,0 +1,30 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { balancedSum } from '../server/ffmpeg-expressions.js';
++
++const maxParenthesisDepth = (value) => {
++    let depth = 0;
++    let maximum = 0;
++    for (const character of value) {
++        if (character === '(') maximum = Math.max(maximum, ++depth);
++        if (character === ')') depth -= 1;
++    }
++    return maximum;
++};
++
++test('balancedSum preserves one term and combines two terms', () => {
++    assert.equal(balancedSum([]), '0');
++    assert.equal(balancedSum(['a']), 'a');
++    assert.equal(balancedSum(['a', 'b']), '(a+b)');
++});
++
++test('balancedSum forms deterministic balanced groups', () => {
++    assert.equal(balancedSum(['a', 'b', 'c', 'd']), '((a+b)+(c+d))');
++    assert.equal(balancedSum(['a', 'b', 'c', 'd', 'e']), '((a+b)+(c+(d+e)))');
++});
++
++test('balancedSum keeps large expression depth far below FFmpeg limit', () => {
++    const expression = balancedSum(Array.from({ length: 128 }, (_, index) => `term${index}`));
++    assert.equal((expression.match(/term\d+/g) || []).length, 128);
++    assert.ok(maxParenthesisDepth(expression) <= 7);
++});

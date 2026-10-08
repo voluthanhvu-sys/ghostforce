@@ -1,0 +1,204 @@
+--- a/server/detail-evidence.js
++++ b/server/detail-evidence.js
+@@ -177,3 +177,30 @@
+   return capEvidenceEvents(merged, maxSamples);
+ };
+ 
++const compactText = (value, limit) => String(value || '')
++  .replace(/[\t\r\n]+/g, ' ')
++  .replace(/\s+/g, ' ')
++  .trim()
++  .slice(0, limit);
++
++export const buildDetailMultimodalRequest = ({ prompt, evidenceText, frames } = {}) => {
++  const parts = [
++    { text: String(prompt || '') },
++    { text: `PART-LOCAL EVIDENCE: ${compactText(evidenceText, 60000)}` },
++  ];
++  for (const frame of Array.isArray(frames) ? frames : []) {
++    const t = Number(frame?.t);
++    const jpeg = frame?.jpeg;
++    if (!Number.isFinite(t) || !Buffer.isBuffer(jpeg) || !jpeg.length) continue;
++    const reasons = (Array.isArray(frame.reasons) ? frame.reasons : [])
++      .map((reason) => compactText(reason, 80))
++      .filter(Boolean)
++      .join(', ');
++    parts.push({ text: `[FRAME t=${t.toFixed(3)}s reasons=${reasons || 'visual-safety'}]` });
++    parts.push({ inlineData: { mimeType: 'image/jpeg', data: jpeg.toString('base64') } });
++  }
++  return {
++    contents: [{ role: 'user', parts }],
++    generationConfig: { temperature: 0, responseMimeType: 'application/json' },
++  };
++};
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -15,6 +15,7 @@
+ import { runGoogleSttChunkWithRetry } from './server/google-stt-retry.js';
+ import { firstMeaningfulFfmpegError } from './server/ffmpeg-diagnostics.js';
+ import { balancedSum } from './server/ffmpeg-expressions.js';
++import { buildDetailMultimodalRequest } from './server/detail-evidence.js';
+ 
+ const __dirname = path.dirname(fileURLToPath(import.meta.url));
+ const app = express();
+@@ -2012,6 +2013,51 @@
+     });
+     ff.on('error', () => resolve(null));
+ });
++
++const extractDetailJpegFrame = (mediaPath, t, job) => new Promise((resolve, reject) => {
++    if (job?.cancelled) return reject(new Error('cancelled'));
++    const ff = spawn('ffmpeg', [
++        '-hide_banner', '-loglevel', 'error',
++        '-i', mediaPath, '-ss', String(Math.max(0, Number(t) || 0)),
++        '-map', '0:v:0', '-frames:v', '1', '-an',
++        '-c:v', 'mjpeg', '-q:v', '3', '-f', 'image2pipe', 'pipe:1',
++    ], { env: ffmpegEnv, windowsHide: true });
++    if (job) job.ffmpeg = ff;
++    const chunks = [];
++    let stderr = '';
++    let settled = false;
++    const signal = job ? ensureAbort(job).signal : null;
++    const onAbort = () => ff.kill();
++    const finish = (err, value) => {
++        if (settled) return;
++        settled = true;
++        if (signal) signal.removeEventListener('abort', onAbort);
++        if (job?.ffmpeg === ff) job.ffmpeg = null;
++        if (err) reject(err); else resolve(value);
++    };
++    if (signal) signal.addEventListener('abort', onAbort, { once: true });
++    ff.stdout.on('data', (chunk) => chunks.push(chunk));
++    ff.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
++    ff.on('error', (err) => finish(err));
++    ff.on('close', (code) => {
++        if (job?.cancelled || signal?.aborted) return finish(new Error('cancelled'));
++        const jpeg = Buffer.concat(chunks);
++        if (code !== 0 || !jpeg.length) return finish(new Error((stderr || `ffmpeg exit ${code}`).slice(-500)));
++        finish(null, jpeg);
++    });
++});
++
++async function extractDetailEvidenceJpegs(mediaPath, evidenceEvents, job) {
++    const frames = [];
++    for (const event of Array.isArray(evidenceEvents) ? evidenceEvents : []) {
++        if (job?.cancelled) throw new Error('cancelled');
++        const t = Number(event?.t);
++        if (!Number.isFinite(t) || t < 0) continue;
++        const jpeg = await extractDetailJpegFrame(mediaPath, t, job);
++        frames.push({ t, reasons: Array.isArray(event.reasons) ? [...event.reasons] : [], jpeg });
++    }
++    return frames;
++}
+ 
+ const rgbColScore = (rgb, gw, gh, other) => {
+     const col = new Array(gw).fill(0);
+@@ -2872,6 +2918,67 @@
+     } finally {
+         if (onLog) onLog(`[EDIT TIMING] ${timingLabel}: ${((Date.now() - aiStartedAt) / 1000).toFixed(2)}s`);
+     }
++}
++
++async function vertexGenerateDetailMultimodal(auth, model, frames, evidenceText, userPrompt, duration, minSec, job, onLog, sceneCuts = null) {
++    const modelId = vertexModelId(model);
++    const locations = [...new Set(['global', auth.location || 'us-central1'])];
++    const prompt = editorSysPrompt(userPrompt, duration, 1, minSec, false, true, true, sceneCuts);
++    const body = JSON.stringify(buildDetailMultimodalRequest({ prompt, evidenceText, frames }));
++    let lastErr = '';
++    for (const loc of locations) {
++        const url = `https://${loc === 'global' ? 'aiplatform.googleapis.com' : `${loc}-aiplatform.googleapis.com`}/v1/projects/${auth.project}/locations/${loc}/publishers/google/models/${modelId}:generateContent`;
++        for (let attempt = 1; attempt <= 3; attempt++) {
++            if (job?.cancelled) throw new Error('cancelled');
++            try {
++                if (attempt > 1) {
++                    onLog?.(`[EDIT] Vertex retry ${attempt}/3 @ ${loc}…`);
++                    try { auth = await getAdcAuth(); } catch { /* keep token */ }
++                    await sleepJob(2000 * attempt, job);
++                }
++                const { res, j } = await runSerializedVertexPost(job, onLog, async () => {
++                    const res = await fetch(url, {
++                        method: 'POST',
++                        headers: {
++                            Authorization: `Bearer ${auth.token}`,
++                            'Content-Type': 'application/json',
++                            'x-goog-user-project': auth.project,
++                        },
++                        body,
++                        signal: jobSignal(job, 15 * 60 * 1000),
++                    });
++                    const j = await res.json().catch(() => ({}));
++                    return { res, j };
++                }, { quotaWaitMs: vertexQuotaWaitMs(attempt) });
++                if (!res.ok) {
++                    lastErr = j.error?.message || `Vertex ${res.status} @ ${loc}`;
++                    if (isQuotaErr(lastErr, res.status)) {
++                        await waitQuota(job, onLog, attempt);
++                        continue;
++                    }
++                    if (res.status >= 500) continue;
++                    break;
++                }
++                const text = (j.candidates || []).map((candidate) => (
++                    candidate.content?.parts || []
++                ).map((part) => part.text || '').join('')).join('\n');
++                if (!text.trim()) {
++                    lastErr = `Vertex empty @ ${loc}`;
++                    continue;
++                }
++                return parseGeminiPlan(text, duration, 1, minSec, false, sceneCuts);
++            } catch (err) {
++                if (job?.cancelled) throw new Error('cancelled');
++                const message = err instanceof Error ? err.message : String(err);
++                const cause = err && typeof err === 'object' && err.cause instanceof Error ? err.cause.message : '';
++                if (/abort|timeout/i.test(`${message} ${cause}`)) lastErr = 'Vertex timeout — Gemini xem quá lâu / mạng chậm. Bấm GEMINI lại.';
++                else if (/fetch failed|ECONNRESET|UND_ERR|socket|EAI_AGAIN|network/i.test(`${message} ${cause}`)) lastErr = 'Vertex fetch failed — mất kết nối lúc Gemini đang xem. Bấm GEMINI lại.';
++                else lastErr = message;
++                onLog?.(`[EDIT] ${lastErr}`);
++            }
++        }
++    }
++    throw new Error(lastErr || 'Vertex Detail multimodal failed');
+ }
+ 
+ const parseJsonObject = (text) => {
+@@ -5009,6 +5116,8 @@
+     geminiDeleteFile,
+     getAdcAuth,
+     vertexGeneratePlan,
++    extractDetailEvidenceJpegs,
++    vertexGenerateDetailMultimodal,
+     mixFrameClip,
+ };
+ 
+--- a/tests/detail-evidence.test.js
++++ b/tests/detail-evidence.test.js
+@@ -2,6 +2,7 @@
+ import assert from 'node:assert/strict';
+ import {
+   buildDetailEvidenceTimes,
++  buildDetailMultimodalRequest,
+   mapDiarizationToPartTimeline,
+   mapWordsToPartTimeline,
+ } from '../server/detail-evidence.js';
+@@ -123,3 +124,21 @@
+   assert(first.every((sample, i) => i === 0 || sample.t > first[i - 1].t));
+ });
+ 
++test('builds text plus labeled JPEG Vertex parts without video input', () => {
++  const request = buildDetailMultimodalRequest({
++    prompt: 'detail prompt',
++    evidenceText: 'speech at 1.0s\ncluster change at 2.0s',
++    frames: [
++      { t: 1.25, reasons: ['dialogue-start', 'scene-cut-after'], jpeg: Buffer.from([1, 2, 3]) },
++      { t: Number.NaN, reasons: ['invalid'], jpeg: Buffer.from([4]) },
++    ],
++  });
++  assert.deepEqual(request.generationConfig, { temperature: 0, responseMimeType: 'application/json' });
++  const parts = request.contents[0].parts;
++  assert.equal(parts[0].text, 'detail prompt');
++  assert.match(parts[1].text, /speech at 1\.0s cluster change at 2\.0s/);
++  assert.match(parts[2].text, /t=1\.250s.*dialogue-start.*scene-cut-after/);
++  assert.deepEqual(parts[3], { inlineData: { mimeType: 'image/jpeg', data: 'AQID' } });
++  assert.equal(parts.some((part) => part.inlineData?.mimeType === 'video/mp4'), false);
++  assert.equal(parts.filter((part) => part.inlineData).length, 1);
++});

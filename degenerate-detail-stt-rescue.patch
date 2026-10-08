@@ -1,0 +1,105 @@
+diff --git "a/ghostforge-server.js" b/ghostforge-server.js
+index 17a01ec..266872f 100644
+--- "a/ghostforge-server.js"
++++ b/ghostforge-server.js
+@@ -2278,7 +2278,7 @@ const snapToPeak = (cx, peaks) => {
+     return (best && bd <= 0.28) ? best.x : cx;
+ };
+ 
+-const applySpeechToWindows = (windows, speech) => {
++const applySpeechToWindows = (windows, speech, allowPlanContainOverride = false) => {
+     if (!Array.isArray(speech) || !speech.length || !windows.length) return windows;
+     const forcedWhy = (w) => /cctv|laptop|poster|calendar|already|close-?up|prop|chip|bottle|roulette|empty|black|4\+|crowd/.test(String(w.why || '').toLowerCase());
+     const raw = speech
+@@ -2296,7 +2296,7 @@ const applySpeechToWindows = (windows, speech) => {
+     }
+     const out = [];
+     for (const w of windows) {
+-        if (w.planMode === 'contain') {
++        if (w.planMode === 'contain' && !allowPlanContainOverride) {
+             out.push(w);
+             continue;
+         }
+@@ -2315,7 +2315,7 @@ const applySpeechToWindows = (windows, speech) => {
+             const b = Math.min(w.b, f.b);
+             if (a - cursor >= 0.5) out.push(w.planMode === 'fill'
+                 ? { ...w, a: cursor, b: a }
+-                : { a: cursor, b: a, mode: 'contain', why: 'STT gap' });
++                : { a: cursor, b: a, mode: 'contain', why: 'STT gap', planMode: w.planMode });
+             if (b - a >= 0.65) {
+                 out.push({
+                     a, b, mode: 'fill', why: f.who, who: f.who,
+@@ -2328,12 +2328,12 @@ const applySpeechToWindows = (windows, speech) => {
+         }
+         if (w.b - cursor >= 0.5) out.push(w.planMode === 'fill'
+             ? { ...w, a: cursor, b: w.b }
+-            : { a: cursor, b: w.b, mode: 'contain', why: 'STT tail' });
++            : { a: cursor, b: w.b, mode: 'contain', why: 'STT tail', planMode: w.planMode });
+     }
+     return out.length ? out : windows;
+ };
+ 
+-const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack, speechLines) => {
++const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack, speechLines, detailPlan = false) => {
+     const probe = await probeMedia(srcPath).catch(() => null);
+     const dur = Number(probe?.durationSec) || 0;
+     const srcW = evenPx(probe?.width || 1920);
+@@ -2354,6 +2354,12 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+     const initialModeCounts = countWindowModes(windows);
+     const track = Array.isArray(speakerTrack) ? speakerTrack.filter((p) => p && Number.isFinite(p.t) && Number.isFinite(p.cx)) : [];
+     const speech = Array.isArray(speechLines) ? speechLines.filter((l) => l && Number.isFinite(l.t) && l.who) : [];
++    const usableSpeechCount = speech.filter((l) => Number.isFinite(l.end) && (l.end - l.t) >= 0.65).length;
++    const degenerateDetailRescue = detailPlan
++        && initialModeCounts.fill === 0
++        && initialModeCounts.contain >= 3
++        && usableSpeechCount >= 8
++        && windows.every((w) => w.planMode === 'contain');
+     const seats = buildSeatLock(speech, track);
+     const seatLog = Object.entries(seats).map(([k, v]) => `${k}@${v.toFixed(2)}`).join(' · ');
+     if (seatLog) onLog?.(`[EDIT] Speaker map (fallback, đổi theo cảnh): ${seatLog}`);
+@@ -2363,7 +2369,10 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+         if (Number.isFinite(s)) l.cx = s;
+     }
+     if (speech.length) {
+-        windows = applySpeechToWindows(windows, speech);
++        if (degenerateDetailRescue) {
++            onLog?.('[EDIT] Degenerate Detail rescue: all-CONTAIN + speech, STT may override non-hard CONTAIN');
++        }
++        windows = applySpeechToWindows(windows, speech, degenerateDetailRescue);
+         how = `${how}+STT`;
+         onLog?.(`[EDIT] STT ${speech.length} lines — fill theo vị trí TRONG CẢNH (không khóa ghế)`);
+     }
+@@ -3488,6 +3497,7 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+             });
+         }
+ 
++        const detailPlanSegmentIndexes = new Set();
+         if (shouldUsePerPartDetailPlan({ mode, tiktokMix, testSec, segmentCount: plan?.segments?.length })) {
+             const lastDetail = partTo > 0 ? partTo : plan.segments.length;
+             const detailTargets = plan.segments
+@@ -3578,6 +3588,7 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                     const parsedFill = detailSeg.frames.filter((frame) => frame?.mode === 'fill').length;
+                     send('log', { message: `[EDIT] Detail PLAN ${ordinal} modes: raw contain=${rawModeCounts.contain} fill=${rawModeCounts.fill} other=${rawModeCounts.other} · parsed contain=${parsedContain} fill=${parsedFill}` });
+                     plan.segments[index] = mergeSegmentDetail(seg, detailSeg);
++                    detailPlanSegmentIndexes.add(index);
+                     detailEnriched += 1;
+                     send('log', { message: `[EDIT] Detail PLAN ${ordinal}: ${detailSeg.frames.length} framing windows · ${detailSeg.track.length} speaker pts` });
+                 } catch (detailErr) {
+@@ -3814,7 +3825,7 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                     if (tiktokMix) {
+                         const localSpeech = speechForSegment(speechAll, seg, cutDur);
+                         if (localSpeech.length) send('log', { message: `[EDIT] STT this part: ${localSpeech.length} lines` });
+-                        await mixFrameClip(cutPath, outPath, job, (m) => send('log', { message: m }), seg.frames, seg.track, localSpeech);
++                        await mixFrameClip(cutPath, outPath, job, (m) => send('log', { message: m }), seg.frames, seg.track, localSpeech, detailPlanSegmentIndexes.has(i));
+                     }
+                     else await padTikTokClip(cutPath, outPath, job);
+                     try { fs.unlinkSync(cutPath); } catch { /* ignore */ }
+@@ -4114,7 +4125,7 @@ app.get('/api/edit/part-test/stream/:jobId', async (req, res) => {
+         }
+ 
+         send('progress', { value: 70, phase: 'render' });
+-        await mixFrameClip(excerptPath, outputPath, job, (message) => send('log', { message }), detailSeg.frames, detailSeg.track, speech);
++        await mixFrameClip(excerptPath, outputPath, job, (message) => send('log', { message }), detailSeg.frames, detailSeg.track, speech, true);
+         const title = String(segment.title || segment.name || `Part ${partIndex}`).replace(/\.(mp4|mov|webm|m4v)$/i, '');
+         const outputName = safeDownloadName(`TEST Part ${partIndex} - ${title}.mp4`);
+         job.originalName = outputName;

@@ -1,0 +1,561 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+index da67dc0..4d5469f 100644
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -64,46 +64,6 @@ const shortPromptHash = (value) => crypto
+     .digest('hex')
+     .slice(0, 8);
+ 
+-const hasFiniteFocusCx = (frame) => frame?.focalCx !== null
+-    && frame?.focalCx !== ''
+-    && Number.isFinite(Number(frame?.focalCx));
+-
+-const countFocusLocks = (frames) => (Array.isArray(frames) ? frames : []).reduce((counts, frame) => {
+-    if (!frame || typeof frame !== 'object' || Array.isArray(frame) || frame.focusLock !== true) return counts;
+-    counts.locks += 1;
+-    if (hasFiniteFocusCx(frame)) counts.actionable += 1;
+-    return counts;
+-}, { locks: 0, actionable: 0 });
+-
+-const detailRawFillMismatchLines = (rawFrames, rawCounts, parsedCounts, prefix) => {
+-    if (Number(rawCounts?.contain) === Number(parsedCounts?.contain)
+-        && Number(rawCounts?.fill) === Number(parsedCounts?.fill)) return [];
+-    const clean = (value, max = 160) => String(value || '')
+-        .replace(/[\r\n\t]+/g, ' ')
+-        .replace(/\s+/g, ' ')
+-        .trim()
+-        .slice(0, max);
+-    const rawValue = (value) => value === undefined ? 'missing' : JSON.stringify(value);
+-    const lines = [];
+-    (Array.isArray(rawFrames) ? rawFrames : []).forEach((frame, index) => {
+-        const rawMode = Array.isArray(frame)
+-            ? frame[2]
+-            : frame?.mode || frame?.kind || frame?.framing || frame?.type;
+-        if (normalizeFrameMode(rawMode) !== 'fill') return;
+-        const start = Array.isArray(frame) ? frame[0] : frame?.start ?? frame?.from ?? frame?.t0;
+-        const end = Array.isArray(frame) ? frame[1] : frame?.end ?? frame?.to ?? frame?.t1;
+-        const why = clean(Array.isArray(frame) ? frame[3] : frame?.why || frame?.reason);
+-        const focusLock = !Array.isArray(frame) && frame?.focusLock === true;
+-        const focalWho = !Array.isArray(frame) ? clean(frame?.focalWho, 80) : '';
+-        const hasFocalCx = !Array.isArray(frame) && frame?.focalCx !== undefined;
+-        const focalCx = focusLock && !hasFiniteFocusCx(frame)
+-            ? ' focalCx=invalid'
+-            : (hasFocalCx ? ` focalCx=${rawValue(frame.focalCx)}` : '');
+-        lines.push(`[EDIT] ${prefix} frame ${index + 1}: ${rawValue(start)}-${rawValue(end)} · why=${JSON.stringify(why)} · focusLock=${focusLock}${focalWho ? ` focalWho=${JSON.stringify(focalWho)}` : ''}${focalCx}`);
+-    });
+-    return lines;
+-};
+-
+ const logParsedDetailWindows = (frames, prefix, onLog) => {
+     const ordered = [...(Array.isArray(frames) ? frames : [])]
+         .sort((a, b) => Number(a?.a) - Number(b?.a));
+@@ -116,20 +76,7 @@ const logParsedDetailWindows = (frames, prefix, onLog) => {
+         const who = clean(frame?.who, 80);
+         const why = clean(frame?.why || frame?.reason);
+         const whoText = who ? ` · who=${who}` : '';
+-        const hasFocusMetadata = frame?.focusLock === true
+-            || Boolean(frame?.focalWho)
+-            || frame?.focalCx !== undefined
+-            || frame?.focalCy !== undefined;
+-        let focusText = '';
+-        if (hasFocusMetadata) {
+-            const focalWho = clean(frame?.focalWho, 80);
+-            const focalCx = hasFiniteFocusCx(frame) ? Number(frame.focalCx).toFixed(2) : 'invalid';
+-            const focalCy = frame?.focalCy !== null && frame?.focalCy !== '' && Number.isFinite(Number(frame?.focalCy))
+-                ? ` focalCy=${Number(frame.focalCy).toFixed(2)}`
+-                : '';
+-            focusText = ` · focusLock=${frame?.focusLock === true}${focalWho ? ` focalWho=${JSON.stringify(focalWho)}` : ''} focalCx=${focalCx}${focalCy}`;
+-        }
+-        onLog(`[EDIT] ${prefix} window ${index + 1}/${ordered.length}: ${Number(frame?.a).toFixed(1)}-${Number(frame?.b).toFixed(1)} ${frame?.mode || ''}${whoText} · why=${JSON.stringify(why)}${focusText}`);
++        onLog(`[EDIT] ${prefix} window ${index + 1}/${ordered.length}: ${Number(frame?.a).toFixed(1)}-${Number(frame?.b).toFixed(1)} ${frame?.mode || ''}${whoText} · why=${JSON.stringify(why)}`);
+     });
+ };
+ 
+@@ -2196,7 +2143,7 @@ const hintCxForWindow = (w, track) => {
+     if (Number.isFinite(w.cx)) return w.cx;
+     if (!Array.isArray(track) || !track.length) return 0.5;
+     const mid = (w.a + w.b) / 2;
+-    let best = null;
++    let best = track[0];
+     let bd = 99;
+     for (const p of track) {
+         if (p.t < w.a - 0.4 || p.t > w.b + 0.4) continue;
+@@ -2226,33 +2173,6 @@ const hintCxAt = (t, w, track) => {
+     return hintCxForWindow(w, track);
+ };
+ 
+-const diagnosticTrackPointForWho = (who, t, track) => {
+-    const name = String(who || '').toLowerCase().trim();
+-    if (!name || !Array.isArray(track) || !track.length) return null;
+-    const matching = track.filter((p) => {
+-        if (!isSpeakerIdentity(p.who)) return false;
+-        const candidate = String(p.who || '').toLowerCase();
+-        return candidate && (candidate === name || candidate.includes(name) || name.includes(candidate));
+-    });
+-    if (!matching.length) return null;
+-    return matching.reduce((best, point) => (
+-        Math.abs((Number(point.t) || 0) - t) < Math.abs((Number(best.t) || 0) - t) ? point : best
+-    ));
+-};
+-
+-const diagnosticNearestTrackHint = (t, w, track) => {
+-    if (!Array.isArray(track) || !track.length) return null;
+-    const nearTime = track
+-        .filter((p) => p.t >= w.a - 0.25 && p.t <= w.b + 0.25)
+-        .sort((a, b) => Math.abs(a.t - t) - Math.abs(b.t - t));
+-    if (nearTime.length) return nearTime[0];
+-    const mid = (w.a + w.b) / 2;
+-    const nearWindow = track
+-        .filter((p) => p.t >= w.a - 0.4 && p.t <= w.b + 0.4)
+-        .sort((a, b) => Math.abs(a.t - mid) - Math.abs(b.t - mid));
+-    return nearWindow[0] || track[0] || null;
+-};
+-
+ const splitFillOnSpeaker = (windows, track) => {
+     if (!Array.isArray(track) || !track.length) return windows;
+     const sameSpeaker = (a, b) => {
+@@ -2266,10 +2186,6 @@ const splitFillOnSpeaker = (windows, track) => {
+             out.push(w);
+             continue;
+         }
+-        if (w.focusLock === true && Number.isFinite(w.focalCx)) {
+-            out.push(w);
+-            continue;
+-        }
+         const inside = track
+             .filter((p) => p.t >= w.a - 0.08 && p.t <= w.b + 0.08)
+             .sort((a, b) => a.t - b.t);
+@@ -2293,11 +2209,6 @@ const splitFillOnSpeaker = (windows, track) => {
+             cy: Number.isFinite(w.cy)
+                 ? w.cy
+                 : (!speechWho || sameSpeaker(speechWho, trackWho) ? trackCy : undefined),
+-            _targetCxSource: Number.isFinite(w.cx)
+-                ? w._targetCxSource
+-                : ((!speechWho || sameSpeaker(speechWho, trackWho)) && Number.isFinite(trackCx) ? 'track-who' : undefined),
+-            _speechWho: w._speechWho,
+-            _speechCx: w._speechCx,
+         });
+         for (let i = 1; i < inside.length; i++) {
+             const p = inside[i];
+@@ -2401,10 +2312,6 @@ const applySpeechToWindows = (windows, speech, allowPlanContainOverride = false)
+     }
+     const out = [];
+     for (const w of windows) {
+-        if (w.mode === 'fill' && w.focusLock === true && Number.isFinite(w.focalCx)) {
+-            out.push(w);
+-            continue;
+-        }
+         if (w.planMode === 'contain' && !allowPlanContainOverride) {
+             out.push(w);
+             continue;
+@@ -2431,9 +2338,6 @@ const applySpeechToWindows = (windows, speech, allowPlanContainOverride = false)
+                     planMode: w.planMode,
+                     cx: Number.isFinite(f.cx) ? f.cx : undefined,
+                     cy: Number.isFinite(f.cy) ? f.cy : undefined,
+-                    _targetCxSource: Number.isFinite(f.cx) ? 'speech' : undefined,
+-                    _speechWho: f.who,
+-                    _speechCx: Number.isFinite(f.cx) ? f.cx : undefined,
+                 });
+             }
+             cursor = Math.max(cursor, b);
+@@ -2457,15 +2361,7 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+         windows = buildMixWindows(scenes, dur);
+         how = windows.length < 3 ? 'timer fallback' : 'scene fallback';
+     } else {
+-        windows = windows.map((w) => ({
+-            ...w,
+-            planMode: w.mode,
+-            cx: w.focusLock === true && Number.isFinite(w.focalCx) ? w.focalCx : w.cx,
+-            cy: w.focusLock === true && Number.isFinite(w.focalCx) && Number.isFinite(w.focalCy) ? w.focalCy : w.cy,
+-            _targetCxSource: w.focusLock === true && Number.isFinite(w.focalCx)
+-                ? 'focal'
+-                : (Number.isFinite(w.cx) ? 'detail' : undefined),
+-        }));
++        windows = windows.map((w) => ({ ...w, planMode: w.mode }));
+     }
+     const countWindowModes = (items) => ({
+         contain: items.filter((w) => w?.mode === 'contain').length,
+@@ -2520,24 +2416,12 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+         if (job?.cancelled) throw new Error('cancelled');
+         const tLock = Math.max(0.04, w.a + 0.04);
+         const speakerWho = resolveSpeakerWho({ windowWho: w.who }) || '';
++        const displayLabel = speakerWho || w.why || '';
+         const nowCx = cxForWhoAt(speakerWho, tLock, track, NaN);
+         const lineCx = Number.isFinite(w.cx) ? w.cx : NaN;
+         const locked = seatCx(speakerWho, seats, NaN);
+         const wantCx = [lineCx, nowCx, locked].find((v) => Number.isFinite(v));
+         const hint = Number.isFinite(wantCx) ? wantCx : hintCxAt(tLock, w, track);
+-        const whoTrackPoint = diagnosticTrackPointForWho(speakerWho, tLock, track);
+-        const nearestTrackPoint = diagnosticNearestTrackHint(tLock, w, track);
+-        const baseCxSource = Number.isFinite(lineCx)
+-            ? (w._targetCxSource || 'unknown')
+-            : Number.isFinite(nowCx)
+-                ? 'track-who'
+-                : Number.isFinite(locked)
+-                    ? 'seat'
+-                    : nearestTrackPoint && Number.isFinite(nearestTrackPoint.cx)
+-                        ? 'track-nearest'
+-                        : 'default';
+-        const diagnosticTrackPoint = whoTrackPoint || nearestTrackPoint;
+-        const seatConsulted = !Number.isFinite(lineCx) && !Number.isFinite(nowCx);
+         const cy = Number.isFinite(w.cy) ? w.cy : 0.40;
+         let cx = hint;
+         let sampled0 = { closeup: false, empty: false, crowded: false, peaks: [], puppetRatio: 1, faceH: 0, twoShot: false };
+@@ -2545,7 +2429,6 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+             sampled0 = await sampleTalkerTimed(tLock);
+             cx = snapToPeak(hint, sampled0.peaks);
+         } catch { /* keep hint */ }
+-        const rgbCx = cx;
+         const trueEmpty = sampled0.empty && sampled0.puppetRatio < 0.03;
+         if (trueEmpty) {
+             w.mode = 'contain';
+@@ -2576,7 +2459,7 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+         w.cy = cy;
+         const origB = w.b;
+         const side = cx < 0.5 ? 'LEFT' : 'RIGHT';
+-        onLog?.(`[EDIT]   FILL ${Number(w.a).toFixed(1)}–${Number(w.b).toFixed(1)}s  who=${JSON.stringify(speakerWho)} why=${JSON.stringify(rawWhy)}  ${side} cx ${cx.toFixed(2)}${sampled0.twoShot ? ' two-shot' : ''}`);
++        onLog?.(`[EDIT]   FILL ${Number(w.a).toFixed(1)}–${Number(w.b).toFixed(1)}s  ${displayLabel || 'talk'}  ${side} cx ${cx.toFixed(2)}${sampled0.twoShot ? ' two-shot' : ''}`);
+         pts.push({ t: Math.max(0, w.a), cx, cy, who: speakerWho });
+         for (let t = w.a + 0.9; t < origB - 0.55; t += 0.9) {
+             try {
+@@ -2600,13 +2483,6 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+             } catch { /* keep */ }
+         }
+         pts.push({ t: Math.max(w.a + 0.03, w.b), cx, cy, who: speakerWho });
+-        const trackDiagnostic = diagnosticTrackPoint
+-            ? ` track=${JSON.stringify(String(diagnosticTrackPoint.who || ''))}@${Number(diagnosticTrackPoint.t).toFixed(2)} cx=${Number(diagnosticTrackPoint.cx).toFixed(2)}`
+-            : '';
+-        const speechDiagnostic = w._speechWho || Number.isFinite(w._speechCx)
+-            ? ` speechWho=${JSON.stringify(String(w._speechWho || ''))} speechCx=${Number.isFinite(w._speechCx) ? Number(w._speechCx).toFixed(2) : 'none'}`
+-            : '';
+-        onLog?.(`[EDIT] Fill target ${Number(w.a).toFixed(1)}-${Number(w.b).toFixed(1)}: planMode=${w.planMode || 'none'} who=${JSON.stringify(rawWho)} why=${JSON.stringify(rawWhy)} windowCx=${Number.isFinite(lineCx) ? lineCx.toFixed(2) : 'none'}${speechDiagnostic}${trackDiagnostic} seatCx=${Number.isFinite(locked) ? locked.toFixed(2) : 'none'} seatConsulted=${seatConsulted ? 'yes' : 'no'} baseCx=${Number(hint).toFixed(2)} source=${baseCxSource} rgb=${Number(hint).toFixed(2)}->${Number(rgbCx).toFixed(2)} moved=${Math.abs(rgbCx - hint) > 0.001 ? 'yes' : 'no'} finalCx=${Number(w.cx).toFixed(2)}`);
+     }
+     let forceProtected = 0;
+     let forceEligible = 0;
+@@ -3726,17 +3602,7 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                     }
+                     const parsedContain = detailSeg.frames.filter((frame) => frame?.mode === 'contain').length;
+                     const parsedFill = detailSeg.frames.filter((frame) => frame?.mode === 'fill').length;
+-                    const rawFocusCounts = countFocusLocks(rawDetailFrames);
+-                    const parsedFocusCounts = countFocusLocks(detailSeg.frames);
+                     send('log', { message: `[EDIT] Detail PLAN ${ordinal} modes: raw contain=${rawModeCounts.contain} fill=${rawModeCounts.fill} other=${rawModeCounts.other} · parsed contain=${parsedContain} fill=${parsedFill}` });
+-                    send('log', { message: `[EDIT] Detail focus raw ${ordinal}: locks=${rawFocusCounts.locks} actionable=${rawFocusCounts.actionable}` });
+-                    send('log', { message: `[EDIT] Detail focus parsed ${ordinal}: locks=${parsedFocusCounts.locks} actionable=${parsedFocusCounts.actionable}` });
+-                    detailRawFillMismatchLines(
+-                        rawDetailFrames,
+-                        rawModeCounts,
+-                        { contain: parsedContain, fill: parsedFill },
+-                        `Detail raw FILL ${ordinal}`,
+-                    ).forEach((message) => send('log', { message }));
+                     logParsedDetailWindows(detailSeg.frames, 'Detail', (message) => send('log', { message }));
+                     plan.segments[index] = mergeSegmentDetail(seg, detailSeg);
+                     detailPlanSegmentIndexes.add(index);
+@@ -4238,17 +4104,7 @@ app.get('/api/edit/part-test/stream/:jobId', async (req, res) => {
+         }
+         const parsedContain = detailSeg.frames.filter((frame) => frame?.mode === 'contain').length;
+         const parsedFill = detailSeg.frames.filter((frame) => frame?.mode === 'fill').length;
+-        const rawFocusCounts = countFocusLocks(rawFrames);
+-        const parsedFocusCounts = countFocusLocks(detailSeg.frames);
+         send('log', { message: `[EDIT] Detail PLAN Part ${partIndex} modes: raw contain=${rawCounts.contain} fill=${rawCounts.fill} other=${rawCounts.other} · parsed contain=${parsedContain} fill=${parsedFill}` });
+-        send('log', { message: `[EDIT] TARGETED Detail focus raw Part ${partIndex}: locks=${rawFocusCounts.locks} actionable=${rawFocusCounts.actionable}` });
+-        send('log', { message: `[EDIT] TARGETED Detail focus parsed Part ${partIndex}: locks=${parsedFocusCounts.locks} actionable=${parsedFocusCounts.actionable}` });
+-        detailRawFillMismatchLines(
+-            rawFrames,
+-            rawCounts,
+-            { contain: parsedContain, fill: parsedFill },
+-            `TARGETED Detail raw FILL Part ${partIndex}`,
+-        ).forEach((message) => send('log', { message }));
+         logParsedDetailWindows(detailSeg.frames, 'TARGETED Detail', (message) => send('log', { message }));
+ 
+         const fallbackSpeech = plan?._raw ? parseSpeechLines(plan._raw, duration) : [];
+@@ -5154,11 +5010,6 @@ export {
+     getAdcAuth,
+     vertexGeneratePlan,
+     mixFrameClip,
+-    hintCxForWindow,
+-    applySpeechToWindows,
+-    splitFillOnSpeaker,
+-    countFocusLocks,
+-    detailRawFillMismatchLines,
+ };
+ 
+ if (process.env.GHOSTFORGE_STANDALONE === '1') {
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+index 478fca6..270a860 100644
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -123,8 +123,6 @@ FRAMING — required. 9:16 mix of WIDE vs CLOSE. Re-evaluate framing often, but
+    DETAIL VISUAL SHOT SEGMENTATION: independently watch the video for every meaningful visual shot boundary: hard cut, camera-angle change, composition change, reaction shot, subject-layout change, insert/object shot, or focal-subject change.
+    Whenever such a meaningful visual boundary occurs, start a NEW frames[] window and independently classify that new shot as FILL or CONTAIN. The mode may remain the same across the boundary: same mode does NOT mean same shot, and same story/context does NOT mean same shot. Never merge visually distinct shots merely because their framing mode is unchanged.
+    DETAIL DIALOGUE SEGMENTATION: one frames[] window represents ONE visually continuous shot/composition, never an entire conversation, topic, or story beat. During dialogue, every new camera angle, visible speaker-focus change, reaction shot, composition/layout change, or cut to another puppet/person MUST start a new frames[] window even when the topic is unchanged, the mode remains the same, or everyone remains in the same room. Never use "back-and-forth argument", "conversation continues", or "group discussion" to justify one window spanning multiple visually distinct shots. For multi-shot dialogue, independently classify EACH shot as FILL or CONTAIN.
+-   FRAMING-DECISION CONTINUITY: a Detail frames[] window represents ONE CONTINUOUS FRAMING DECISION, not merely one continuous camera shot, unchanged background, or unchanged room. Start a NEW frames[] window whenever the subject that should control framing materially changes: visual focus moves from one speaker to another, a listener/reaction becomes the visually dominant subject, focus returns from that reaction subject to another character, or the subject whose action/expression should control the crop changes. This applies to BOTH CONTAIN and FILL. The new window may independently choose the SAME mode as the previous window; for example, CONTAIN may remain CONTAIN across the boundary, but the new interval must still be independently classified and justified. Camera, background, room, or conversation-topic continuity does NOT justify one long Detail window after the framing target has materially changed.
+-   Do NOT split for every small eye movement, mouth movement, gesture, pose change, or momentary gaze shift. Split only for a MATERIAL change in visual attention or in the subject controlling the framing decision. Segmentation happens before mode classification; focusLock is evaluated only later as optional post-FILL metadata and MUST NOT influence segmentation.
+    Candidate sceneCuts are supplementary trusted anchors for obvious cuts, not an exhaustive boundary list. Also identify meaningful visual/composition boundaries that are NOT listed in sceneCuts; visual segmentation must not depend solely on those hints.
+    Boundaries must come from observed visual changes. Do not use fixed-duration slicing, arbitrary segmentation, forced alternation, a target window count, or a target FILL/CONTAIN percentage.
+    contain = WIDE (full 16:9 small in 9:16 + blur bars). Use CONTAIN for crowds, inserts, CCTV/laptop/poster/calendar views, prop-only shots, source shots already visually tight, or whenever cropping would lose relevant visual information.
+@@ -137,13 +135,6 @@ FRAMING — required. 9:16 mix of WIDE vs CLOSE. Re-evaluate framing often, but
+    DIALOGUE GUARD: in normal dialogue with 1–2 visible puppets, FILL the speaking/focal puppet when a useful medium crop exists; do not mark the whole interaction CONTAIN merely because another puppet is visible. With 3 visible puppets, generally FILL the active speaker when a useful medium crop exists; three puppets alone is NOT sufficient reason for CONTAIN.
+    WIDE-ONLY EXCEPTIONS: reserve CONTAIN for genuine wide/context needs such as a crowd or many puppets whose necessary context would be lost, an establishing/context shot, CCTV/laptop/poster/calendar/prop-only insert, a genuinely off-camera speaker, or a source shot already so tight that further cropping is harmful.
+    ANTI-DEGENERATE CHECK: do NOT return an all-CONTAIN plan for a normal dialogue segment. All-CONTAIN is allowed only when essentially the entire segment genuinely consists of the WIDE-ONLY EXCEPTIONS above. Before returning JSON, if frames[] contains zero FILL windows, re-check whether the segment truly qualifies as wide-only; if ordinary visible dialogue exists, create the appropriate FILL window(s).
+-   INDEPENDENT MODE CLASSIFICATION: classify EACH segmented framing-decision window independently. Do not inherit CONTAIN from the previous window, the same room/background, the same conversation, another visible puppet, or the overall scene containing multiple characters. For the CURRENT window, choose FILL when one subject's face, reaction, or action clearly controls visual attention and a normal FILL crop preserves the information needed for that beat.
+-   CONTAIN requires information that is simultaneously necessary to understand the CURRENT visual beat and would actually be lost by a normal FILL crop: for example, two subjects' simultaneous actions/expressions are both essential, a prop/cause and reaction truly must remain visible together, or an action materially spans the wide frame and cannot be represented by one focal crop. Merely having 2 or 3 visible characters is NOT sufficient. If one character performs the dominant reaction/action while another character is only contextual, prefer FILL on the dominant visual subject.
+-   REACTION/ACTION MODE: a strong reaction, tantrum, accusation, physical gag, or expressive action performed primarily by one visible subject should normally be FILL when that subject can be framed without losing essential simultaneous context. Do NOT keep it CONTAIN merely because another character remains visible. If the dominant visual subject materially changes, segmentation must create a new window first; never solve that change by keeping one wide CONTAIN window.
+-   MODE SELECTION FIRST: first classify every visually continuous shot as CONTAIN or FILL using the normal framing rules, DIALOGUE GUARD, REACTION rule, and WIDE-ONLY EXCEPTIONS above. Reaction-focus metadata MUST NOT influence whether a shot is classified as CONTAIN or FILL. Evaluate focusLock only AFTER a shot has already been classified as FILL. Do not choose CONTAIN merely because focalWho or focalCx is uncertain, a reaction lock is not applicable, or focusLock fields are omitted. If a normal dialogue/reaction shot qualifies for FILL under the framing rules, keep it FILL even when no focusLock metadata is emitted.
+-   OPTIONAL REACTION FOCUS LOCK (Detail only): when a FILL shot is visually centered on a non-speaking reaction/focal subject, another person speaks during that SAME continuous shot, and switching the crop to the active speaker would lose the intended reaction, emotional beat, or visual beat, you MUST emit focusLock:true, focalWho:"<visual focal subject>", focalCx:<source-frame x of that subject>, and focalCy:<source-frame y when known>. focalCx is REQUIRED whenever focusLock=true; focalWho should name the visible focal subject when identifiable, and focalCy is optional.
+-   Keep focusLock sparse. Do NOT use focusLock for ordinary dialogue, merely because a listener/reaction is visible, normal shot/reverse-shot, when the active speaker is already the visual focal subject, every emotional line, a long conversation, or an entire scene/topic. One lock applies only to ONE visually continuous shot/composition. If camera angle, layout, or focal subject changes, start a new frames[] window. For every ordinary FILL window, omit focusLock/focalWho/focalCx/focalCy and let normal active-speaker tracking continue.
+-   Detail reaction-focus example only (the timestamp, name, and coordinates are illustrative, not required values): {"start":68.4,"end":72.1,"mode":"fill","why":"Jeffy's reaction remains the visual focus while Marvin speaks","focusLock":true,"focalWho":"Jeffy","focalCx":0.72,"focalCy":0.40}
+    DETAIL WHY CONTRACT: EVERY frames[] object MUST include a non-empty "why" based on concrete visible evidence. For FILL, briefly name the focal subject or visual beat. For CONTAIN, state exactly what important visual information a reasonable medium crop would lose. "Another puppet is visible" is NOT a sufficient CONTAIN reason. Vague reasons such as "context", "wide shot", "conversation", "scene", or "multiple characters" alone are insufficient.
+    Detail frames[] mini-example: [{"start":0.0,"end":4.2,"mode":"contain","why":"both puppets' simultaneous reaction is required"},{"start":4.2,"end":8.0,"mode":"fill","cx":0.73,"cy":0.40,"why":"Jeffy is the focal speaker"}]
+    At EVERY candidate scene cut, make a fresh independent framing classification for the new shot itself. Do not inherit CONTAIN merely because the story or context is similar. The mode may remain the same across the cut only because the new shot independently satisfies the same decision. This requires fresh classification, not a mandatory FILL, CONTAIN, mode change, or split.
+@@ -230,10 +221,6 @@ export const stitchFrames = (windows, epDur, sceneCuts = null) => {
+             cy: w.cy,
+             cx2: w.cx2,
+             cy2: w.cy2,
+-            focusLock: w.focusLock === true,
+-            focalWho: w.focalWho,
+-            focalCx: w.focalCx,
+-            focalCy: w.focalCy,
+         }))
+         .sort((a, b) => a.a - b.a);
+     if (!list.length) return [];
+@@ -244,7 +231,7 @@ export const stitchFrames = (windows, epDur, sceneCuts = null) => {
+         const b = Math.min(dur, w.b);
+         if (b - a < 0.7) continue;
+         if (!last) {
+-            out.push({ a: 0, b, mode: w.mode, why: w.why, cx: w.cx, cy: w.cy, cx2: w.cx2, cy2: w.cy2, focusLock: w.focusLock, focalWho: w.focalWho, focalCx: w.focalCx, focalCy: w.focalCy });
++            out.push({ a: 0, b, mode: w.mode, why: w.why, cx: w.cx, cy: w.cy, cx2: w.cx2, cy2: w.cy2 });
+             continue;
+         }
+         if (a > last.b + 0.12) last.b = round1(a);
+@@ -267,10 +254,6 @@ export const stitchFrames = (windows, epDur, sceneCuts = null) => {
+                 cy: w.cy,
+                 cx2: w.cx2,
+                 cy2: w.cy2,
+-                focusLock: w.focusLock,
+-                focalWho: w.focalWho,
+-                focalCx: w.focalCx,
+-                focalCy: w.focalCy,
+             });
+         }
+     }
+@@ -292,7 +275,7 @@ export const parseFraming = (s, epStart, epEnd, sceneCuts = null) => {
+     const epDur = Math.max(0.2, epEnd - epStart);
+     const items = [];
+     for (const f of raw) {
+-        let a, b, mode, why = '', cx, cy, cx2, cy2, focusLock = false, focalWho, focalCx, focalCy;
++        let a, b, mode, why = '', cx, cy, cx2, cy2;
+         if (Array.isArray(f) && f.length >= 2) {
+             a = Number(f[0]); b = Number(f[1]); mode = normalizeFrameMode(f[2]); why = String(f[3] || '');
+         } else if (f && typeof f === 'object') {
+@@ -304,11 +287,6 @@ export const parseFraming = (s, epStart, epEnd, sceneCuts = null) => {
+             cy = clamp01(f.cy ?? f.y, NaN);
+             cx2 = clamp01(f.cx2 ?? f.x2, Number.isFinite(cx) ? cx : NaN);
+             cy2 = clamp01(f.cy2 ?? f.y2, Number.isFinite(cy) ? cy : NaN);
+-            focusLock = f.focusLock === true;
+-            const rawFocalWho = String(f.focalWho || '').trim().slice(0, 48);
+-            focalWho = isSpeakerIdentity(rawFocalWho) ? rawFocalWho : undefined;
+-            focalCx = clamp01(f.focalCx, NaN);
+-            focalCy = clamp01(f.focalCy, NaN);
+         } else continue;
+         if (!Number.isFinite(a) || !Number.isFinite(b) || b - a < 0.6 || !mode) continue;
+         items.push({
+@@ -317,10 +295,6 @@ export const parseFraming = (s, epStart, epEnd, sceneCuts = null) => {
+             cy: Number.isFinite(cy) ? cy : undefined,
+             cx2: Number.isFinite(cx2) ? cx2 : undefined,
+             cy2: Number.isFinite(cy2) ? cy2 : undefined,
+-            focusLock,
+-            focalWho,
+-            focalCx: Number.isFinite(focalCx) ? focalCx : undefined,
+-            focalCy: Number.isFinite(focalCy) ? focalCy : undefined,
+         });
+     }
+     if (!items.length) return [];
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+index 2fd8df4..02cc82d 100644
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan, sourceTimeForTrackPoint, shouldUsePerPartDetailPlan, mergeSegmentDetail, compactSceneCutHints, detailSceneCutGuidance, detailSemanticFramingGuidance, stitchFrames, isSpeakerIdentity, resolveSpeakerWho, parseSpeechLines, parseFraming } from '../server/editor-plan.js';
++import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan, sourceTimeForTrackPoint, shouldUsePerPartDetailPlan, mergeSegmentDetail, compactSceneCutHints, detailSceneCutGuidance, detailSemanticFramingGuidance, stitchFrames, isSpeakerIdentity, resolveSpeakerWho, parseSpeechLines } from '../server/editor-plan.js';
+ 
+ test('evenSplitPlan creates contiguous bounded segments', () => {
+   const segs = evenSplitPlan(360, 3, 60, false);
+@@ -67,21 +67,6 @@ test('detail framing rejects degenerate all-contain dialogue without a fill quot
+   assert.doesNotMatch(guidance, /50[–-]65%/);
+ });
+ 
+-test('detail classifies each segmented window independently with a strict contain gate', () => {
+-  const guidance = detailSemanticFramingGuidance();
+-  assert.match(guidance, /classify EACH segmented framing-decision window independently/i);
+-  assert.match(guidance, /Do not inherit CONTAIN from the previous window, the same room\/background, the same conversation/i);
+-  assert.match(guidance, /Merely having 2 or 3 visible characters is NOT sufficient/i);
+-  assert.match(guidance, /choose FILL when one subject's face, reaction, or action clearly controls visual attention/is);
+-  assert.match(guidance, /strong reaction, tantrum, accusation, physical gag, or expressive action.*should normally be FILL/is);
+-  assert.match(guidance, /two subjects' simultaneous actions\/expressions are both essential/i);
+-  assert.match(guidance, /prop\/cause and reaction truly must remain visible together/i);
+-  assert.match(guidance, /action materially spans the wide frame/i);
+-  assert.match(guidance, /segmentation must create a new window first.*never solve that change by keeping one wide CONTAIN window/is);
+-  assert.doesNotMatch(guidance, /minimum FILL count|target FILL\/CONTAIN ratio|max(?:imum)? CONTAIN duration/i);
+-  assert.match(guidance, /focusLock only AFTER a shot has already been classified as FILL/i);
+-});
+-
+ test('detail frames require concrete reasons for contain and fill', () => {
+   const guidance = detailSemanticFramingGuidance();
+   assert.match(guidance, /EVERY frames\[\] object MUST include a non-empty "why"/);
+@@ -111,60 +96,6 @@ test('detail dialogue uses one framing window per continuous visual shot', () =>
+   assert.doesNotMatch(guidance, /maximum CONTAIN duration|target FILL ratio/i);
+ });
+ 
+-test('detail windows follow material framing-decision changes without over-segmentation', () => {
+-  const guidance = detailSemanticFramingGuidance();
+-  assert.match(guidance, /Detail frames\[\] window represents ONE CONTINUOUS FRAMING DECISION/i);
+-  assert.match(guidance, /not merely one continuous camera shot, unchanged background, or unchanged room/i);
+-  assert.match(guidance, /Start a NEW frames\[\] window whenever the subject that should control framing materially changes/i);
+-  assert.match(guidance, /listener\/reaction becomes the visually dominant subject/i);
+-  assert.match(guidance, /This applies to BOTH CONTAIN and FILL/i);
+-  assert.match(guidance, /CONTAIN may remain CONTAIN across the boundary/i);
+-  assert.match(guidance, /Camera, background, room, or conversation-topic continuity does NOT justify one long Detail window/i);
+-  assert.match(guidance, /Do NOT split for every small eye movement, mouth movement, gesture, pose change, or momentary gaze shift/i);
+-  assert.match(guidance, /Split only for a MATERIAL change in visual attention/i);
+-  assert.match(guidance, /focusLock is evaluated only later as optional post-FILL metadata and MUST NOT influence segmentation/i);
+-});
+-
+-test('detail reaction focus guidance is narrow and requires focalCx', () => {
+-  const guidance = detailSemanticFramingGuidance();
+-  assert.match(guidance, /focusLock/);
+-  assert.match(guidance, /focalWho/);
+-  assert.match(guidance, /focalCx/);
+-  assert.match(guidance, /"focusLock":true.*"focalWho":"Jeffy".*"focalCx":0\.72.*"focalCy":0\.40/i);
+-  assert.match(guidance, /non-speaking reaction\/focal subject.*you MUST emit focusLock:true/is);
+-  assert.match(guidance, /focalCx is REQUIRED whenever focusLock=true/i);
+-  assert.match(guidance, /Do NOT use focusLock for ordinary dialogue/i);
+-  assert.match(guidance, /One lock applies only to ONE visually continuous shot\/composition/i);
+-  assert.match(guidance, /active speaker is already the visual focal subject/i);
+-  assert.match(guidance, /ordinary FILL window, omit focusLock\/focalWho\/focalCx\/focalCy/i);
+-  assert.match(guidance, /example only.*illustrative, not required values/i);
+-  assert.match(guidance, /MODE SELECTION FIRST: first classify every visually continuous shot as CONTAIN or FILL/i);
+-  assert.match(guidance, /Reaction-focus metadata MUST NOT influence whether a shot is classified as CONTAIN or FILL/i);
+-  assert.match(guidance, /Evaluate focusLock only AFTER a shot has already been classified as FILL/i);
+-  assert.match(guidance, /Do not choose CONTAIN merely because focalWho or focalCx is uncertain.*focusLock fields are omitted/i);
+-  assert.match(guidance, /keep it FILL even when no focusLock metadata is emitted/i);
+-  assert.ok(guidance.indexOf('DIALOGUE GUARD:') < guidance.indexOf('MODE SELECTION FIRST:'));
+-  assert.ok(guidance.indexOf('MODE SELECTION FIRST:') < guidance.indexOf('OPTIONAL REACTION FOCUS LOCK'));
+-});
+-
+-test('detail parser and stitch preserve optional reaction focus fields', () => {
+-  const frames = parseFraming({ frames: [{
+-    start: 0,
+-    end: 4,
+-    mode: 'fill',
+-    why: 'Jeffy reaction remains visually important',
+-    focusLock: true,
+-    focalWho: 'Jeffy',
+-    focalCx: 0.72,
+-    focalCy: 0.41,
+-  }] }, 0, 4, []);
+-  assert.equal(frames.length, 1);
+-  assert.equal(frames[0].focusLock, true);
+-  assert.equal(frames[0].focalWho, 'Jeffy');
+-  assert.equal(frames[0].focalCx, 0.72);
+-  assert.equal(frames[0].focalCy, 0.41);
+-});
+-
+ test('detail scene-cut hints remain non-mandatory re-evaluation points', () => {
+   const guidance = `${detailSemanticFramingGuidance()}${detailSceneCutGuidance([4.2], 10)}`;
+   assert.match(guidance, /Candidate visual shot boundaries.*4\.2/);
+diff --git a/tests/detail-focus-lock.test.js b/tests/detail-focus-lock.test.js
+deleted file mode 100644
+index 129fa3f..0000000
+--- a/tests/detail-focus-lock.test.js
++++ /dev/null
+@@ -1,58 +0,0 @@
+-import test from 'node:test';
+-import assert from 'node:assert/strict';
+-import { applySpeechToWindows, splitFillOnSpeaker, countFocusLocks, detailRawFillMismatchLines } from '../ghostforge-server.js';
+-
+-const speech = [{ t: 1, end: 3, who: 'Marvin', cx: 0.2, cy: 0.4 }];
+-
+-test('valid focus lock prevents overlapping STT from replacing Detail FILL', () => {
+-  const locked = [{ a: 0, b: 4, mode: 'fill', planMode: 'fill', focusLock: true, focalWho: 'Jeffy', focalCx: 0.72 }];
+-  assert.deepEqual(applySpeechToWindows(locked, speech), locked);
+-});
+-
+-test('unlocked Detail FILL keeps existing active-speaker STT behavior', () => {
+-  const windows = [{ a: 0, b: 4, mode: 'fill', planMode: 'fill', cx: 0.72 }];
+-  const result = applySpeechToWindows(windows, speech);
+-  assert.equal(result.some((w) => w.who === 'Marvin' && w.cx === 0.2), true);
+-});
+-
+-test('focus lock without valid focalCx keeps existing STT behavior', () => {
+-  const windows = [{ a: 0, b: 4, mode: 'fill', planMode: 'fill', focusLock: true, focalWho: 'Jeffy' }];
+-  const result = applySpeechToWindows(windows, speech);
+-  assert.equal(result.some((w) => w.who === 'Marvin' && w.cx === 0.2), true);
+-});
+-
+-test('speaker track does not split or retarget a valid focus-locked FILL', () => {
+-  const locked = [{ a: 0, b: 4, mode: 'fill', planMode: 'fill', focusLock: true, focalWho: 'Jeffy', focalCx: 0.72 }];
+-  const track = [
+-    { t: 0.5, who: 'Marvin', cx: 0.2 },
+-    { t: 2.5, who: 'Junior', cx: 0.8 },
+-  ];
+-  assert.deepEqual(splitFillOnSpeaker(locked, track), locked);
+-});
+-
+-test('focus diagnostics distinguish absent, invalid, and actionable locks', () => {
+-  assert.deepEqual(countFocusLocks([{ mode: 'fill' }]), { locks: 0, actionable: 0 });
+-  assert.deepEqual(countFocusLocks([
+-    { focusLock: true },
+-    { focusLock: true, focalCx: 'invalid' },
+-  ]), { locks: 2, actionable: 0 });
+-  assert.deepEqual(countFocusLocks([
+-    { focusLock: true, focalCx: 0.72 },
+-    { focusLock: true, focalCx: '0.31' },
+-  ]), { locks: 2, actionable: 2 });
+-});
+-
+-test('raw FILL mismatch diagnostics emit only on count mismatch without mutation', () => {
+-  const raw = [
+-    { start: '45.0', end: '45.5', mode: 'fill', why: 'short reaction', focusLock: true, focalWho: 'Jeffy' },
+-    { start: 45.5, end: 52, mode: 'contain', why: 'wide context' },
+-  ];
+-  const before = structuredClone(raw);
+-  assert.deepEqual(detailRawFillMismatchLines(raw, { contain: 1, fill: 1 }, { contain: 1, fill: 1 }, 'TARGETED Detail raw FILL Part 3'), []);
+-  const lines = detailRawFillMismatchLines(raw, { contain: 1, fill: 1 }, { contain: 1, fill: 0 }, 'TARGETED Detail raw FILL Part 3');
+-  assert.equal(lines.length, 1);
+-  assert.match(lines[0], /frame 1: "45\.0"-"45\.5"/);
+-  assert.match(lines[0], /why="short reaction"/);
+-  assert.match(lines[0], /focusLock=true focalWho="Jeffy" focalCx=invalid/);
+-  assert.deepEqual(raw, before);
+-});
+diff --git a/tests/edit-track-hint.test.js b/tests/edit-track-hint.test.js
+deleted file mode 100644
+index 3f29b3d..0000000
+--- a/tests/edit-track-hint.test.js
++++ /dev/null
+@@ -1,24 +0,0 @@
+-import test from 'node:test';
+-import assert from 'node:assert/strict';
+-import { hintCxForWindow } from '../ghostforge-server.js';
+-
+-test('hintCxForWindow uses a track point inside the existing local time range', () => {
+-  const window = { a: 72.1, b: 72.6 };
+-  const track = [
+-    { t: 0, cx: 0.58 },
+-    { t: 72.3, cx: 0.27 },
+-  ];
+-
+-  assert.equal(hintCxForWindow(window, track), 0.27);
+-});
+-
+-test('hintCxForWindow returns neutral fallback when no track point is local', () => {
+-  const window = { a: 72.1, b: 72.6 };
+-  const track = [
+-    { t: 0, cx: 0.58 },
+-    { t: 20, cx: 0.31 },
+-  ];
+-
+-  assert.equal(hintCxForWindow(window, track), 0.5);
+-  assert.notEqual(hintCxForWindow(window, track), track[0].cx);
+-});

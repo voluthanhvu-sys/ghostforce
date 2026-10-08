@@ -1,0 +1,49 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -2143,7 +2143,7 @@ const hintCxForWindow = (w, track) => {
+     if (Number.isFinite(w.cx)) return w.cx;
+     if (!Array.isArray(track) || !track.length) return 0.5;
+     const mid = (w.a + w.b) / 2;
+-    let best = track[0];
++    let best = null;
+     let bd = 99;
+     for (const p of track) {
+         if (p.t < w.a - 0.4 || p.t > w.b + 0.4) continue;
+@@ -5069,6 +5069,7 @@ export {
+     getAdcAuth,
+     vertexGeneratePlan,
+     mixFrameClip,
++    hintCxForWindow,
+ };
+ 
+ if (process.env.GHOSTFORGE_STANDALONE === '1') {
+diff --git a/tests/edit-track-hint.test.js b/tests/edit-track-hint.test.js
+new file mode 100644
+--- /dev/null
++++ b/tests/edit-track-hint.test.js
+@@ -0,0 +1,24 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { hintCxForWindow } from '../ghostforge-server.js';
++
++test('hintCxForWindow uses a track point inside the existing local time range', () => {
++  const window = { a: 72.1, b: 72.6 };
++  const track = [
++    { t: 0, cx: 0.58 },
++    { t: 72.3, cx: 0.27 },
++  ];
++
++  assert.equal(hintCxForWindow(window, track), 0.27);
++});
++
++test('hintCxForWindow returns neutral fallback when no track point is local', () => {
++  const window = { a: 72.1, b: 72.6 };
++  const track = [
++    { t: 0, cx: 0.58 },
++    { t: 20, cx: 0.31 },
++  ];
++
++  assert.equal(hintCxForWindow(window, track), 0.5);
++  assert.notEqual(hintCxForWindow(window, track), track[0].cx);
++});

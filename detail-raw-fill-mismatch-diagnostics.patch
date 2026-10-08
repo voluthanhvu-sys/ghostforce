@@ -1,0 +1,88 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -76,6 +76,37 @@ const countFocusLocks = (frames) => (Array.isArray(frames) ? frames : []).reduce
+     return counts;
+ }, { locks: 0, actionable: 0 });
+ 
++const detailRawFillMismatchLines = (rawFrames, rawCounts, parsedCounts, prefix) => {
++    if (Number(rawCounts?.contain) === Number(parsedCounts?.contain)
++        && Number(rawCounts?.fill) === Number(parsedCounts?.fill)) return [];
++    const clean = (value, max = 160) => String(value || '')
++        .replace(/[\r\n\t]+/g, ' ')
++        .replace(/\s+/g, ' ')
++        .trim()
++        .slice(0, max);
++    const rawValue = (value) => value === undefined ? 'missing' : JSON.stringify(value);
++    const lines = [];
++    (Array.isArray(rawFrames) ? rawFrames : []).forEach((frame, index) => {
++        const rawMode = Array.isArray(frame)
++            ? frame[2]
++            : frame?.mode || frame?.kind || frame?.framing || frame?.type;
++        if (normalizeFrameMode(rawMode) !== 'fill') return;
++        const start = Array.isArray(frame) ? frame[0] : frame?.start ?? frame?.from ?? frame?.t0;
++        const end = Array.isArray(frame) ? frame[1] : frame?.end ?? frame?.to ?? frame?.t1;
++        const why = clean(Array.isArray(frame) ? frame[3] : frame?.why || frame?.reason);
++        const focusLock = !Array.isArray(frame) && frame?.focusLock === true;
++        const focalWho = !Array.isArray(frame) ? clean(frame?.focalWho, 80) : '';
++        const hasFocalCx = !Array.isArray(frame) && frame?.focalCx !== undefined;
++        const focalCx = focusLock && !hasFiniteFocusCx(frame)
++            ? ' focalCx=invalid'
++            : (hasFocalCx ? ` focalCx=${rawValue(frame.focalCx)}` : '');
++        lines.push(`[EDIT] ${prefix} frame ${index + 1}: ${rawValue(start)}-${rawValue(end)} · why=${JSON.stringify(why)} · focusLock=${focusLock}${focalWho ? ` focalWho=${JSON.stringify(focalWho)}` : ''}${focalCx}`);
++    });
++    return lines;
++};
++
+ const logParsedDetailWindows = (frames, prefix, onLog) => {
+@@ -3701,6 +3732,12 @@
+                     send('log', { message: `[EDIT] Detail focus raw ${ordinal}: locks=${rawFocusCounts.locks} actionable=${rawFocusCounts.actionable}` });
+                     send('log', { message: `[EDIT] Detail focus parsed ${ordinal}: locks=${parsedFocusCounts.locks} actionable=${parsedFocusCounts.actionable}` });
++                    detailRawFillMismatchLines(
++                        rawDetailFrames,
++                        rawModeCounts,
++                        { contain: parsedContain, fill: parsedFill },
++                        `Detail raw FILL ${ordinal}`,
++                    ).forEach((message) => send('log', { message }));
+                     logParsedDetailWindows(detailSeg.frames, 'Detail', (message) => send('log', { message }));
+@@ -4207,6 +4244,12 @@
+         send('log', { message: `[EDIT] TARGETED Detail focus raw Part ${partIndex}: locks=${rawFocusCounts.locks} actionable=${rawFocusCounts.actionable}` });
+         send('log', { message: `[EDIT] TARGETED Detail focus parsed Part ${partIndex}: locks=${parsedFocusCounts.locks} actionable=${parsedFocusCounts.actionable}` });
++        detailRawFillMismatchLines(
++            rawFrames,
++            rawCounts,
++            { contain: parsedContain, fill: parsedFill },
++            `TARGETED Detail raw FILL Part ${partIndex}`,
++        ).forEach((message) => send('log', { message }));
+         logParsedDetailWindows(detailSeg.frames, 'TARGETED Detail', (message) => send('log', { message }));
+@@ -5118,6 +5161,7 @@ export {
+     splitFillOnSpeaker,
+     countFocusLocks,
++    detailRawFillMismatchLines,
+ };
+diff --git a/tests/detail-focus-lock.test.js b/tests/detail-focus-lock.test.js
+--- a/tests/detail-focus-lock.test.js
++++ b/tests/detail-focus-lock.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { applySpeechToWindows, splitFillOnSpeaker, countFocusLocks } from '../ghostforge-server.js';
++import { applySpeechToWindows, splitFillOnSpeaker, countFocusLocks, detailRawFillMismatchLines } from '../ghostforge-server.js';
+@@ -43,3 +43,19 @@ test('focus diagnostics distinguish absent, invalid, and actionable locks', () =>
+   ]), { locks: 2, actionable: 2 });
+ });
++
++test('raw FILL mismatch diagnostics emit only on count mismatch without mutation', () => {
++  const raw = [
++    { start: '45.0', end: '45.5', mode: 'fill', why: 'short reaction', focusLock: true, focalWho: 'Jeffy' },
++    { start: 45.5, end: 52, mode: 'contain', why: 'wide context' },
++  ];
++  const before = structuredClone(raw);
++  assert.deepEqual(detailRawFillMismatchLines(raw, { contain: 1, fill: 1 }, { contain: 1, fill: 1 }, 'TARGETED Detail raw FILL Part 3'), []);
++  const lines = detailRawFillMismatchLines(raw, { contain: 1, fill: 1 }, { contain: 1, fill: 0 }, 'TARGETED Detail raw FILL Part 3');
++  assert.equal(lines.length, 1);
++  assert.match(lines[0], /frame 1: "45\.0"-"45\.5"/);
++  assert.match(lines[0], /why="short reaction"/);
++  assert.match(lines[0], /focusLock=true focalWho="Jeffy" focalCx=invalid/);
++  assert.deepEqual(raw, before);
++});

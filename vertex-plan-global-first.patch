@@ -1,0 +1,12 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -2800,7 +2800,7 @@ async function vertexGeneratePlan(auth, model, videoPath, userPrompt, duration,
+     if (onLog) onLog(`[EDIT] Vertex proxy ${shrunk.mb.toFixed(1)}MB`);
+     const b64 = (await fs.promises.readFile(filePath)).toString('base64');
+     const modelId = vertexModelId(model);
+-    const locations = [...new Set([auth.location || 'us-central1', 'global'])];
++    const locations = [...new Set(['global', auth.location || 'us-central1'])];
+     const body = JSON.stringify({
+         contents: [{
+             role: 'user',

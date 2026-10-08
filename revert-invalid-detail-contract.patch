@@ -1,0 +1,73 @@
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -113,7 +113,7 @@ DETAIL SHOT-AWARE FRAMING:
+ Candidate visual shot boundaries (seconds, local to this excerpt): ${timestamps}.
+ These are hints, not mandatory cuts. Re-evaluate CONTAIN versus FILL at every candidate boundary and also at composition changes, reaction shots, speaker-focus changes, object reveals, visual-gag/action onset, or major camera movement.
+ Merge across a candidate boundary only when the crop decision remains the same AND cropping preserves the same important visual information on both sides.
+-Do not create more FILL merely to increase density. Use CONTAIN only when visual information REQUIRED for the current beat genuinely falls outside a reasonable crop around the focal subject. Use FILL when one subject clearly dominates and cropping loses no required visual information.
++Do not create more FILL merely to increase density. Use CONTAIN when cropping one subject would lose important action, reaction, object, text, joke, or spatial context. Use FILL when one subject clearly dominates and cropping loses no relevant visual information.
+ `;
+ };
+ 
+@@ -121,17 +121,14 @@ export const detailSemanticFramingGuidance = () => `
+ FRAMING — required. 9:16 mix of WIDE vs CLOSE. Re-evaluate framing often, but let scene semantics and visual-information preservation determine the mode.
+ 1) frames[] covers the WHOLE episode, no gaps. Same source timestamps as start/end.
+    DETAIL VISUAL SHOT SEGMENTATION: independently watch the video for every meaningful visual shot boundary: hard cut, camera-angle change, composition change, reaction shot, subject-layout change, insert/object shot, or focal-subject change.
+-   Whenever such a meaningful visual boundary occurs, a NEW frames[] window MUST begin and independently classify that new shot as FILL or CONTAIN. The mode may remain the same across the boundary: same mode does NOT mean same shot, and same story/context does NOT mean same shot. Never merge visually distinct shots merely because their framing mode is unchanged.
++   Whenever such a meaningful visual boundary occurs, start a NEW frames[] window and independently classify that new shot as FILL or CONTAIN. The mode may remain the same across the boundary: same mode does NOT mean same shot, and same story/context does NOT mean same shot. Never merge visually distinct shots merely because their framing mode is unchanged.
+    Candidate sceneCuts are supplementary trusted anchors for obvious cuts, not an exhaustive boundary list. Also identify meaningful visual/composition boundaries that are NOT listed in sceneCuts; visual segmentation must not depend solely on those hints.
+-   A long interval between candidate sceneCuts is NOT permission for one long framing window when the visible composition or focal subject changes inside it.
+    Boundaries must come from observed visual changes. Do not use fixed-duration slicing, arbitrary segmentation, forced alternation, a target window count, or a target FILL/CONTAIN percentage.
+-   Every frames[] item MUST include start, end, mode, and why. why must be a short observable visual reason such as "single speaker close-up", "two-shot conversation", "reaction close-up", "object insert", "wide group interaction", or "camera cuts to Chef Pee Pee". Never use abstract reasons such as "important scene", "better framing", "keep context", or "looks good".
+-   contain = WIDE (full 16:9 small in 9:16 + blur bars). Crowds, inserts, CCTV/laptop/poster/calendar views, prop-only shots, and source shots already visually tight are CONTAIN candidates only when required information would fall outside a reasonable focal crop.
++   contain = WIDE (full 16:9 small in 9:16 + blur bars). Use CONTAIN for crowds, inserts, CCTV/laptop/poster/calendar views, prop-only shots, source shots already visually tight, or whenever cropping would lose relevant visual information.
+    fill = MEDIUM 1:1 crop (head + shoulders + chest). A speaker or two-shot alone determines neither FILL nor CONTAIN.
+-   FILL: choose FILL when one subject is the clear focal point of the current shot AND a reasonable subject crop preserves all information necessary to understand the current beat. Every FILL frame MUST include cx and cy at that visible focal subject/object, plus why identifying it. track[] must include matching focal tracking points throughout that FILL interval under the existing track contract.
+-   CONTAIN: choose CONTAIN only when important information necessary to understand the current shot would actually fall outside a reasonable subject crop; specifically, outside a reasonable vertical crop around the current focal subject. CONTAIN is not a generic safe/default choice.
++   FILL: choose FILL when one subject is the clear focal point of the current shot AND a reasonable subject crop preserves all information necessary to understand the current beat.
++   CONTAIN: choose CONTAIN only when important information necessary to understand the current shot would actually fall outside a reasonable subject crop.
+    The mere presence of another person, prop/object, background context, movement, reaction, or spatial context is NOT enough by itself to require CONTAIN. Use CONTAIN only when losing it would materially hurt understanding of the action, joke, reaction, relationship, reveal, or visual beat.
+-   Before returning a long CONTAIN window, verify that its visual composition remains materially stable AND full-frame context remains genuinely necessary throughout it. If either changes, split at that observed visual change. Its why must state the observable information that requires CONTAIN.
+    TWO-SHOT: the two-shot alone determines neither mode. Use FILL when one person is clearly focal, the second person is not needed to understand the beat, and a reasonable crop preserves the meaning. Use CONTAIN when both expressions/actions are simultaneously necessary, their interaction is the beat/joke, important action spans both sides, or the crop would materially remove needed information.
+    REACTION: use FILL for an isolated reaction when the reacting subject is clearly focal. Use CONTAIN when the reaction and its cause/action must be visible together to understand the moment.
+    At EVERY candidate scene cut, make a fresh independent framing classification for the new shot itself. Do not inherit CONTAIN merely because the story or context is similar. The mode may remain the same across the cut only because the new shot independently satisfies the same decision. This requires fresh classification, not a mandatory FILL, CONTAIN, mode change, or split.
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -2661,7 +2661,7 @@ ${String(userPrompt || '').slice(0, 4000)}
+ 
+ Video duration is ${duration.toFixed(2)} seconds.
+ Return JSON only:
+-{"summary":"one line","segments":[{"name":"English Title","nameVi":"Tiêu đề Việt","reason":"why this cut","start":0.0,"end":${testClip ? duration.toFixed(1) : '128.4'}${tiktokMix ? `,"frames":[${Array.isArray(sceneCuts) ? '{"start":0.0,"end":4.2,"mode":"contain","why":"wide two-shot interaction"},{"start":4.2,"end":7.8,"mode":"fill","cx":0.66,"cy":0.42,"why":"single speaker close-up"}' : '{"start":0.0,"end":5.0,"mode":"contain"},{"start":5.0,"end":12.0,"mode":"fill","why":"Jeffy"},{"start":12.0,"end":16.0,"mode":"contain"},{"start":16.0,"end":23.0,"mode":"fill","why":"Brooklyn"}'}],"track":[{"t":5.0,"cx":0.72,"cy":0.42,"who":"Jeffy"},{"t":8.0,"cx":0.74,"cy":0.41,"who":"Jeffy"},{"t":16.0,"cx":0.22,"cy":0.44,"who":"Brooklyn"},{"t":20.0,"cx":0.24,"cy":0.43,"who":"Brooklyn"}]` : ''}}]${testClip ? `,"lines":[{"t":0.12,"end":1.85,"who":"Brooklyn","cx":0.18,"cy":0.42,"text":"spoken words"}]` : ''}}
++{"summary":"one line","segments":[{"name":"English Title","nameVi":"Tiêu đề Việt","reason":"why this cut","start":0.0,"end":${testClip ? duration.toFixed(1) : '128.4'}${tiktokMix ? `,"frames":[{"start":0.0,"end":5.0,"mode":"contain"},{"start":5.0,"end":12.0,"mode":"fill","why":"Jeffy"},{"start":12.0,"end":16.0,"mode":"contain"},{"start":16.0,"end":23.0,"mode":"fill","why":"Brooklyn"}],"track":[{"t":5.0,"cx":0.72,"cy":0.42,"who":"Jeffy"},{"t":8.0,"cx":0.74,"cy":0.41,"who":"Jeffy"},{"t":16.0,"cx":0.22,"cy":0.44,"who":"Brooklyn"},{"t":20.0,"cx":0.24,"cy":0.43,"who":"Brooklyn"}]` : ''}}]${testClip ? `,"lines":[{"t":0.12,"end":1.85,"who":"Brooklyn","cx":0.18,"cy":0.42,"text":"spoken words"}]` : ''}}
+ 
+ ${autoParts
+     ? 'EPISODES: decide count from the content. Cover the story from start to end. Skip only mid-roll ads, outro, subscribe cards.'
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -61,22 +61,9 @@ test('detail guidance requires Gemini to self-segment observed visual shots', ()
+   const guidance = detailSemanticFramingGuidance();
+   assert.match(guidance, /independently watch the video for every meaningful visual shot boundary/i);
+   assert.match(guidance, /hard cut, camera-angle change, composition change, reaction shot, subject-layout change, insert\/object shot, or focal-subject change/i);
+-  assert.match(guidance, /a NEW frames\[\] window MUST begin and independently classify that new shot/i);
++  assert.match(guidance, /start a NEW frames\[\] window and independently classify that new shot/i);
+   assert.match(guidance, /same mode does NOT mean same shot/i);
+   assert.match(guidance, /Never merge visually distinct shots merely because their framing mode is unchanged/i);
+-  assert.match(guidance, /long interval between candidate sceneCuts is NOT permission for one long framing window/i);
+-});
+-
+-test('detail framing contract requires observable reasons and fill coordinates', () => {
+-  const guidance = detailSemanticFramingGuidance();
+-  assert.match(guidance, /Every frames\[\] item MUST include start, end, mode, and why/i);
+-  assert.match(guidance, /why must be a short observable visual reason/i);
+-  assert.match(guidance, /Every FILL frame MUST include cx and cy/i);
+-  assert.match(guidance, /track\[\] must include matching focal tracking points throughout that FILL interval/i);
+-  assert.match(guidance, /CONTAIN is not a generic safe\/default choice/i);
+-  assert.match(guidance, /Before returning a long CONTAIN window/i);
+-  assert.match(guidance, /Do not use fixed-duration slicing/i);
+-  assert.doesNotMatch(guidance, /target FILL\/CONTAIN percentage[^.]*\d+%/i);
+ });
+ 
+ test('detail scene-cut hints remain non-mandatory re-evaluation points', () => {

@@ -1,0 +1,94 @@
+--- a/server/detail-evidence.js
++++ b/server/detail-evidence.js
+@@ -83,6 +83,42 @@
+   return merged;
+ };
+ 
++const REASON_PRIORITY = new Map([
++  ['part-start', 0],
++  ['part-end', 0],
++  ['scene-cut-before', 1],
++  ['scene-cut-after', 1],
++  ['dialogue-start', 2],
++  ['dialogue-end', 2],
++  ['speaker-change', 3],
++  ['speaker-change-before', 4],
++  ['speaker-change-after', 4],
++  ['periodic-safety', 5],
++]);
++
++const eventPriority = (event) => Math.min(
++  ...event.reasons.map((reason) => REASON_PRIORITY.get(reason) ?? 6),
++);
++
++const evenlySelect = (events, count) => {
++  if (count >= events.length) return events;
++  if (count <= 0) return [];
++  return Array.from({ length: count }, (_, i) => (
++    events[Math.floor(((i + 0.5) * events.length) / count)]
++  ));
++};
++
++const capEvidenceEvents = (events, maxSamples) => {
++  const cap = Math.max(1, Math.floor(Number(maxSamples) || 72));
++  if (events.length <= cap) return events;
++  const selected = [];
++  for (let priority = 0; priority <= 6 && selected.length < cap; priority += 1) {
++    const group = events.filter((event) => eventPriority(event) === priority);
++    selected.push(...evenlySelect(group, cap - selected.length));
++  }
++  return selected.sort((a, b) => a.t - b.t);
++};
++
+ export const buildDetailEvidenceTimes = ({
+   duration,
+   sceneCuts = [],
+@@ -92,6 +128,7 @@
+   dialogueGap = 0.75,
+   dedupeEpsilon = 0.12,
+   maxObservationGap = 6,
++  maxSamples = 72,
+ } = {}) => {
+   const dur = Number(duration);
+   if (!finite(dur) || dur <= 0) return [];
+@@ -137,5 +174,5 @@
+     for (let j = 1; j <= count; j += 1) addReason(safety, dur, left + step * j, 'periodic-safety');
+   }
+   merged = mergeNearbyEvents([...merged.flatMap((event) => event.reasons.map((reason) => ({ t: event.t, reason }))), ...safety], dedupeEpsilon);
+-  return merged;
++  return capEvidenceEvents(merged, maxSamples);
+ };
+--- a/tests/detail-evidence.test.js
++++ b/tests/detail-evidence.test.js
+@@ -94,3 +94,31 @@
+   assert(first.every((sample, i) => i === 0 || sample.t > first[i - 1].t));
+ });
+ 
++test('noisy evidence is deterministically capped while preserving priority events', () => {
++  const input = {
++    duration: 120,
++    sceneCuts: [10, 30, 50, 70, 90, 110],
++    words: Array.from({ length: 120 }, (_, i) => ({
++      word: `word-${i}`,
++      t: i + 0.2,
++      end: i + 0.3,
++    })),
++    diarTurns: Array.from({ length: 120 }, (_, i) => ({
++      start: i,
++      end: i + 0.8,
++      speakerId: `SPEAKER_${i % 2}`,
++    })),
++  };
++  const first = buildDetailEvidenceTimes(input);
++  const second = buildDetailEvidenceTimes(input);
++  assert(first.length <= 72);
++  assert.deepEqual(first, second);
++  assert(first.some((sample) => sample.reasons.includes('part-start')));
++  assert(first.some((sample) => sample.reasons.includes('part-end')));
++  for (const cut of input.sceneCuts) {
++    assert(first.some((sample) => Math.abs(sample.t - (cut - 0.2)) < 1e-9 && sample.reasons.includes('scene-cut-before')));
++    assert(first.some((sample) => Math.abs(sample.t - (cut + 0.2)) < 1e-9 && sample.reasons.includes('scene-cut-after')));
++  }
++  assert(first.every((sample) => Number.isFinite(sample.t) && sample.t >= 0 && sample.t < input.duration));
++  assert(first.every((sample, i) => i === 0 || sample.t > first[i - 1].t));
++});

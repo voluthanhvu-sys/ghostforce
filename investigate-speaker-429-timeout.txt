@@ -1,0 +1,71 @@
+INVESTIGATION — Speaker AI 429 / retry / timeout
+Phạm vi: chỉ đọc source. Không gọi API, không xử lý video, không sửa source.
+
+1. Call path xác nhận
+- EDIT TEST 60s đi vào nhánh Vertex tại ghostforge-server.js:3147-3157.
+- Nhánh này truyền timeoutMs = 4 * 60 * 1000 vào vertexJsonVideo().
+- vertexJsonVideo() tạo cùng body inline-base64 một lần, rồi thử lần lượt location cấu hình và global (tối đa 2 location), mỗi location tối đa 5 attempt.
+- Nếu hết retry hoặc gặp lỗi không-cancel, caller tại 3158-3166 ghi lỗi và fallback plan._raw; sau đó Google STT vẫn chạy tại 3167-3178.
+
+2. Vì sao 240s không dừng ở 240s
+- 240s chỉ được đưa vào jobSignal(job, timeoutMs) ngay bên trong từng lệnh fetch (2717), nên đó là timeout của MỖI HTTP request.
+- Mỗi attempt tạo AbortSignal.timeout(240s) mới. Không có deadline tổng quanh toàn bộ vertexJsonVideo(), retry loop hoặc backoff.
+- waitQuota() và sleepJob() nằm ngoài fetch nên không bị AbortSignal.timeout(240s) của request trước đó giới hạn.
+- Pulse/heartbeat dùng t0 của toàn function, nhưng chỉ in timeoutMs như một cap hiển thị; nó không kiểm tra hoặc dừng khi elapsed vượt cap. Vì vậy log 368s / 240s là đúng với source hiện tại và chỉ ra thời gian toàn chuỗi retry đã vượt mốc timeout-per-request.
+
+3. Cơ chế 429 và thời gian chờ thực tế
+- Một HTTP response 429 hoặc message quota/resource exhausted đi qua isQuotaErr() (1565; 2720-2724).
+- waitQuota(job, onLog, attempt) chọn số giây: min(90, 8 + attempt^2 * 10).
+- Với attempt 1..5: 18s, 48s, 90s, 90s, 90s — khớp chính xác TEST B.
+- Trước attempt 2..5, code còn refresh ADC theo best-effort và sleepJob(1500 * attempt): 3s + 4.5s + 6s + 7.5s = 21s mỗi location. Các sleep này không có log riêng.
+- Vì vậy một location nhận 429 ở cả 5 attempt đã có 336s quota-backoff + 21s retry-delay = 357s, chưa tính thời gian HTTP, parse response và refresh auth. Hai location có worst case 714s delay cục bộ, chưa tính các phần còn lại.
+- Không dùng Retry-After header: waitQuota() chỉ nhận job/onLog/attempt, không nhận response/header.
+
+4. Số request thực tế của TEST B
+- Từ 5 dòng backoff có thể xác nhận ít nhất 5 response quota đã xảy ra ở một hoặc nhiều location, với attempt counter reset theo location.
+- Không thể xác định chính xác số POST từ log đã nêu, vì source không log từng POST/HTTP status/location cho tất cả attempt.
+- Control flow cho phép tối đa 10 POST full-video (5 attempt x 2 location). Sau attempt 5 tại location đầu tiên, code vẫn chuyển sang global và có thể gửi tiếp full body.
+- Một response thành công có JSON parse được return ngay, nên nó không bị retry tiếp hoặc bị kết quả khác ghi đè. Trong run này không có kết quả hợp lệ trước lỗi cuối cùng.
+
+5. Retry khác
+- Response HTTP >=500: continue sang attempt kế tiếp, không waitQuota; chỉ có retry-delay 1.5 * attempt giây ở attempt sau.
+- Response nonempty nhưng JSON invalid: tối đa 2 response invalid toàn function, sau đó throw để caller fallback; đây là protection JSON đã có, khác với 429.
+- Response success nhưng text rỗng: retry tiếp; không có giới hạn riêng ngoài 5 attempt/location.
+- Lỗi fetch/timeout: catch lưu lastErr rồi loop tiếp; không có log retry riêng cho Speaker AI và không có backoff ngoài retry-delay ở attempt sau.
+
+6. Cancel
+- sleepJob() kiểm tra job.cancelled mỗi tối đa 400ms và throw cancelled (1557-1563). Vì vậy cancel trong backoff dừng gần như ngay, độ trễ tối đa xấp xỉ 400ms.
+- Cancel endpoint gọi abortJob(), đặt job.cancelled và abort AbortController. Fetch đang chạy nhận job signal bị abort.
+- Caller phân biệt lỗi cancelled và rethrow, không chạy fallback (3158-3161). Vì vậy behavior cancel hiện có được giữ.
+
+7. Ý nghĩa của speaker AI 374.35s
+- Timing speaker AI bắt đầu sau khi speaker proxy đã được tạo; nó đo toàn bộ vertexJsonVideo từ sau shrink/base64 cho tới finally (2687-2768).
+- Với 5 quota wait được log: 18 + 48 + 90 + 90 + 90 = 336s; cộng retry-delay 21s và thời gian response/auth/parse cho ra 374.35s là phù hợp control flow. Source không cho phép tách chính xác từng phần còn lại nếu không thêm telemetry.
+
+8. Các policy có thể chọn (chưa implement)
+A. Giữ 5 retry/location, thêm overall deadline thực.
+   - Deadline bao toàn bộ: ADC refresh, retry delay, HTTP, JSON parse, quota wait và cả hai location.
+   - Mỗi fetch phải dùng timeout nhỏ hơn hoặc bằng thời gian còn lại; waitQuota/retry-delay chỉ ngủ tối đa thời gian còn lại.
+   - Ưu: vẫn giữ retry 429 và cơ hội thành công khi quota hồi nhanh; chặn run vượt deadline.
+   - Nhược: cần chọn deadline; khi hết deadline sẽ fallback dù quota có thể hồi sau đó.
+
+B. Giảm retry per location.
+   - Ví dụ 2 hoặc 3 attempt/location. Đây giảm worst-case request/full-video và wait rất mạnh, nhưng có thể bỏ lỡ quota hồi sau những backoff dài.
+   - Rủi ro accuracy gián tiếp: fallback plan + Google STT không có identity/cx/cy tương đương dedicated Speaker AI. Không phải lựa chọn ưu tiên nếu accuracy là số một.
+
+C. Giữ retry count nhưng cap tổng quota-backoff.
+   - Theo dõi tổng thời gian waitQuota trong riêng Speaker AI; khi cap đạt thì throw để caller dùng fallback hiện có.
+   - Ưu: nhắm trực tiếp vào 336s của TEST B, vẫn cho retry sớm.
+   - Nhược: không cap thời gian HTTP/5xx/auth; không tự nó bảo đảm thời gian tổng.
+
+Khuyến nghị policy (chưa sửa): kết hợp A + C ở mức tối thiểu. Dùng overall deadline thật 180s cho EDIT TEST Speaker AI, bao cả mọi retry và backoff; đồng thời cap quota-backoff bằng thời gian còn lại. 180s lớn hơn đáng kể speaker call bình thường đã quan sát (~20s) và vẫn cho phép các 429 transient sớm (18s, 48s) cùng một request kế tiếp, nhưng ngăn pattern 18+48+90+90+90s. Với production, policy nên tách cấu hình/được xác nhận riêng thay vì tự áp cùng con số TEST.
+
+9. Những gì không thay đổi khi áp dụng policy A+C đúng cách
+- Prompt, model, proxy, speaker parsing, cx/cy, Google STT, RGB refinement và FFmpeg không cần đổi.
+- Nếu Speaker AI thành công trong ngân sách, output/chất lượng không đổi.
+- Nếu hết ngân sách do 429, hệ thống đi đúng fallback hiện có: plan._raw rồi Google STT; job vẫn hoàn tất trừ cancel.
+
+Kết luận
+- Root cause của 374.35s là retry 429 quota với 336s waitQuota đã log, cộng retry-delay 21s/location và overhead; timeout 240s không phải deadline tổng.
+- Không có bằng chứng source cho thấy response Speaker AI thành công bị ghi đè hoặc retry sau khi return.
+- Safe patch nhỏ nhất nếu được yêu cầu: chỉ bổ sung deadline tổng/cap backoff trong vertexJsonVideo(), giữ số retry và fallback/cancel hiện có.

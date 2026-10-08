@@ -1,0 +1,45 @@
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -52,9 +52,16 @@ export const scriptLabel = (pieces) => pieces.map((p) => {
+     return `${tag}${p.start}–${p.end}`;
+ }).join(' > ');
+ 
++const NON_SPEAKER_IDENTITIES = new Set([
++    'none', 'null', 'unknown', 'nobody', 'speaker', 'narrator',
++    'no speaker', 'no-speaker', 'no_speaker', 'not applicable', 'n/a',
++]);
++
+ export const isSpeakerIdentity = (value) => {
+     const name = String(value || '').trim().replace(/\s+/g, ' ');
+     if (!name || name.length > 48) return false;
++    const normalized = name.toLowerCase();
++    if (NON_SPEAKER_IDENTITIES.has(normalized)) return false;
+     const words = name.split(' ');
+     if (words.length < 1 || words.length > 4) return false;
+     return words.every((word) => /^[\p{L}\p{M}][\p{L}\p{M}'’.-]*$/u.test(word));
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -2198,7 +2198,7 @@ const buildSeatLock = (speech, track) => {
+     const add = (who, cx) => {
+         if (!isSpeakerIdentity(who)) return;
+         const k = String(who || '').toLowerCase().trim();
+-        if (!k || k === 'unknown' || k === 'narrator') return;
++        if (!k) return;
+         if (!Number.isFinite(cx)) return;
+         if (!samples[k]) samples[k] = [];
+         samples[k].push(cx);
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -39,6 +39,9 @@ test('speaker identity accepts normal aliases and rejects narrative text', () =>
+   for (const name of ['Brooklyn Guy', 'Chef Pee Pee', "Cody's Dad", 'Brooklyn-Guy', 'Mr. Goodman']) {
+     assert.equal(isSpeakerIdentity(name), true, name);
+   }
++  for (const sentinel of ['none', 'NONE', 'null', 'unknown', 'nobody', 'speaker', 'narrator', 'no speaker', 'no-speaker', 'no_speaker', 'not applicable', 'n/a']) {
++    assert.equal(isSpeakerIdentity(sentinel), false, sentinel);
++  }
+   assert.equal(isSpeakerIdentity('Puppet laughs at the TV and heads to bed'), false);
+   assert.equal(isSpeakerIdentity('Junior walks into the room'), false);
+ });

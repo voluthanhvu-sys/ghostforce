@@ -1,0 +1,15 @@
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -2018,9 +2018,10 @@
+     if (job?.cancelled) return reject(new Error('cancelled'));
+     const ff = spawn('ffmpeg', [
+         '-hide_banner', '-loglevel', 'error',
+-        '-i', mediaPath, '-ss', String(Math.max(0, Number(t) || 0)),
++        '-ss', String(Math.max(0, Number(t) || 0)), '-i', mediaPath,
+         '-map', '0:v:0', '-frames:v', '1', '-an',
+-        '-c:v', 'mjpeg', '-q:v', '3', '-f', 'image2pipe', 'pipe:1',
++        '-vf', "scale='min(640,iw)':-2:flags=fast_bilinear",
++        '-c:v', 'mjpeg', '-q:v', '5', '-f', 'image2pipe', 'pipe:1',
+     ], { env: ffmpegEnv, windowsHide: true });
+     if (job) job.ffmpeg = ff;
+     const chunks = [];

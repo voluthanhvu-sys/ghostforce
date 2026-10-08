@@ -1,0 +1,174 @@
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -4269,32 +4269,103 @@
+         const sceneCuts = compactSceneCutHints(await detectSceneTimes(excerptPath, duration, job), duration);
+         send('log', { message: `[EDIT] TARGETED Detail settings Part ${partIndex}: model=${model} promptHash=${shortPromptHash(userPrompt)} sceneCuts=${sceneCuts.length} temperature=0` });
+ 
+-        const proxyStartedAt = Date.now();
+-        await runEditEncode([
+-            '-y', '-i', excerptPath, '-vf', "scale='min(854,iw)':-2", '-r', '12',
+-        ], [
+-            '-c:a', 'aac', '-b:a', '64k', '-ac', '1', '-movflags', '+faststart', proxyPath,
+-        ], job, 32, true);
+-        logTiming(`detail proxy Part ${partIndex}`, proxyStartedAt);
++        const targetedHybridEnabled = process.env.GHOSTFORGE_HYBRID_DETAIL === '1';
++        let localTurns = null;
++        let words = null;
++        if (targetedHybridEnabled) {
++            const diarStartedAt = Date.now();
++            try {
++                localTurns = await runLocalDiarization(excerptPath, job);
++            } catch (err) {
++                if (job.cancelled) throw err;
++                send('log', { message: `[EDIT] Local Listen fallback: ${err instanceof Error ? err.message : String(err)}`.slice(0, 240) });
++            } finally {
++                logTiming('local speaker diarization', diarStartedAt);
++            }
++            const sttStartedAt = Date.now();
++            try {
++                const auth = await getAdcAuth();
++                words = await googleSttWords(auth, excerptPath, duration, job, (message) => send('log', { message }));
++            } catch (err) {
++                if (job.cancelled) throw err;
++                send('log', { message: `[EDIT] Google STT skip: ${err instanceof Error ? err.message : String(err)}`.slice(0, 220) });
++            } finally {
++                logTiming('Google STT', sttStartedAt);
++            }
++        }
+ 
+         const detailMinSec = Math.max(12, Math.min(25, duration * 0.35));
+-        let plan;
+-        if (apiKey) {
+-            const uploaded = await geminiUploadVideo(apiKey, proxyPath, `target-part-${partIndex}`);
++        let plan = null;
++        if (targetedHybridEnabled) {
+             try {
+-                const startedAt = Date.now();
+-                plan = await geminiGeneratePlan(apiKey, model, uploaded.uri, userPrompt, duration, 1, detailMinSec, false, true, true, sceneCuts, 0);
+-                logTiming(`detail AI Part ${partIndex}`, startedAt);
+-            } finally {
+-                await geminiDeleteFile(apiKey, uploaded.name);
+-            }
+-        } else {
+-            const auth = await getAdcAuth();
+-            plan = await vertexGeneratePlan(
+-                auth, model, proxyPath, userPrompt, duration, 1, detailMinSec, job,
+-                (message) => send('log', { message }), false, true, true,
+-                `detail AI Part ${partIndex}`, sceneCuts, 0,
+-            );
++                if (!Array.isArray(localTurns) || !Array.isArray(words)) throw new Error('raw diarization/STT evidence unavailable');
++                const evidenceEvents = buildDetailEvidenceTimes({
++                    duration,
++                    sceneCuts,
++                    words,
++                    diarTurns: localTurns,
++                });
++                const evidenceFrames = await extractDetailEvidenceJpegs(
++                    excerptPath,
++                    evidenceEvents,
++                    job,
++                    (message) => send('log', { message }),
++                );
++                send('log', { message: `[EDIT] Targeted Hybrid Detail Part ${partIndex}: ${evidenceFrames.length} evidence frames` });
++                const evidenceText = JSON.stringify({
++                    part: {
++                        title: segment.title || segment.name || '',
++                        duration,
++                        globalFrames: segment.frames || [],
++                        globalTrack: segment.track || [],
++                    },
++                    sceneCuts,
++                    words,
++                    diarization: localTurns,
++                });
++                const auth = await getAdcAuth();
++                plan = await vertexGenerateDetailMultimodal(
++                    auth, model, evidenceFrames, evidenceText, userPrompt,
++                    duration, detailMinSec, job,
++                    (message) => send('log', { message }),
++                    sceneCuts,
++                );
++                const hybridDetailSeg = plan?.segments?.[0];
++                if (!hybridDetailSeg?.frames?.length || !hybridDetailSeg?.track?.length) {
++                    throw new Error('hybrid detail PLAN missing framing or speaker track');
++                }
++                send('log', { message: `[EDIT] Targeted Hybrid Detail Part ${partIndex} success` });
++            } catch (err) {
++                if (job.cancelled) throw err;
++                plan = null;
++                send('log', { message: `[EDIT] Targeted Hybrid Detail Part ${partIndex} failed -> video Detail fallback` });
++            }
++        }
++        if (!plan) {
++            const proxyStartedAt = Date.now();
++            await runEditEncode([
++                '-y', '-i', excerptPath, '-vf', "scale='min(854,iw)':-2", '-r', '12',
++            ], [
++                '-c:a', 'aac', '-b:a', '64k', '-ac', '1', '-movflags', '+faststart', proxyPath,
++            ], job, 32, true);
++            logTiming(`detail proxy Part ${partIndex}`, proxyStartedAt);
++            if (apiKey) {
++                const uploaded = await geminiUploadVideo(apiKey, proxyPath, `target-part-${partIndex}`);
++                try {
++                    const startedAt = Date.now();
++                    plan = await geminiGeneratePlan(apiKey, model, uploaded.uri, userPrompt, duration, 1, detailMinSec, false, true, true, sceneCuts, 0);
++                    logTiming(`detail AI Part ${partIndex}`, startedAt);
++                } finally {
++                    await geminiDeleteFile(apiKey, uploaded.name);
++                }
++            } else {
++                const auth = await getAdcAuth();
++                plan = await vertexGeneratePlan(
++                    auth, model, proxyPath, userPrompt, duration, 1, detailMinSec, job,
++                    (message) => send('log', { message }), false, true, true,
++                    `detail AI Part ${partIndex}`, sceneCuts, 0,
++                );
++            }
+         }
+         const detailSeg = plan?.segments?.[0];
+         if (!detailSeg?.frames?.length || !detailSeg?.track?.length) throw new Error('detail PLAN missing framing or speaker track');
+@@ -4314,14 +4385,14 @@
+         logParsedDetailWindows(detailSeg.frames, 'TARGETED Detail', (message) => send('log', { message }));
+ 
+         const fallbackSpeech = plan?._raw ? parseSpeechLines(plan._raw, duration) : [];
+-        let localTurns = null;
+         let localMapping = null;
+         try {
+-            const startedAt = Date.now();
+-            localTurns = await runLocalDiarization(excerptPath, job);
++            const startedAt = targetedHybridEnabled ? 0 : Date.now();
++            if (!targetedHybridEnabled) localTurns = await runLocalDiarization(excerptPath, job);
++            if (!Array.isArray(localTurns)) throw new Error('local diarization unavailable');
+             localMapping = mapDiarizationToPlan(localTurns, plan, (message) => send('log', { message }));
+             if (!localMapping.ok) throw new Error(localMapping.reason);
+-            logTiming('local speaker diarization', startedAt);
++            if (startedAt) logTiming('local speaker diarization', startedAt);
+         } catch (err) {
+             if (job.cancelled) throw err;
+             localTurns = null;
+@@ -4329,10 +4400,13 @@
+             send('log', { message: `[EDIT] Local Listen fallback: ${err instanceof Error ? err.message : String(err)}`.slice(0, 240) });
+         }
+         let speech = fallbackSpeech;
+-        const sttStartedAt = Date.now();
++        const sttStartedAt = targetedHybridEnabled ? 0 : Date.now();
+         try {
+-            const auth = await getAdcAuth();
+-            const words = await googleSttWords(auth, excerptPath, duration, job, (message) => send('log', { message }));
++            if (!targetedHybridEnabled) {
++                const auth = await getAdcAuth();
++                words = await googleSttWords(auth, excerptPath, duration, job, (message) => send('log', { message }));
++            }
++            if (!Array.isArray(words)) words = [];
+             if (localTurns && localMapping && words.length) {
+                 speech = [
+                     ...mergeDiarizationWords(words, localMapping),
+@@ -4345,7 +4419,7 @@
+             if (job.cancelled) throw err;
+             send('log', { message: `[EDIT] Google STT skip: ${err instanceof Error ? err.message : String(err)}`.slice(0, 220) });
+         } finally {
+-            logTiming('Google STT', sttStartedAt);
++            if (sttStartedAt) logTiming('Google STT', sttStartedAt);
+         }
+ 
+         send('progress', { value: 70, phase: 'render' });

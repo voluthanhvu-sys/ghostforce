@@ -1,0 +1,31 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -2340,6 +2340,8 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+         }
+     };
+     let demoted = 0;
++    const identityDiagnostics = job || {};
++    if (!Number.isFinite(identityDiagnostics.editIdentityDiagnosticCount)) identityDiagnostics.editIdentityDiagnosticCount = 0;
+     for (const w of windows) {
+         if (w.mode !== 'fill') continue;
+         if (job?.cancelled) throw new Error('cancelled');
+@@ -2371,6 +2373,18 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+             onLog?.(`[EDIT]   fill→wide ${Number(w.a).toFixed(1)}–${Number(w.b).toFixed(1)}s  (already CU, no STT who)`);
+             continue;
+         }
++        const rawWho = String(w.who || '').trim();
++        const rawWhy = String(w.why || '').trim();
++        const windowRange = `${Number(w.a).toFixed(1)}-${Number(w.b).toFixed(1)}`;
++        if (identityDiagnostics.editIdentityDiagnosticCount < 12 && (rawWho || rawWhy) && rawWho !== rawWhy) {
++            onLog?.(`[EDIT] Window identity ${windowRange}: who=${JSON.stringify(rawWho)} why=${JSON.stringify(rawWhy)}`);
++            identityDiagnostics.editIdentityDiagnosticCount += 1;
++        }
++        const whoWordCount = rawWho ? rawWho.split(/\s+/).length : 0;
++        if (identityDiagnostics.editIdentityDiagnosticCount < 12 && whoWordCount >= 3 && whoWordCount <= 4 && isSpeakerIdentity(rawWho)) {
++            onLog?.(`[EDIT] Speaker identity inspect: who=${JSON.stringify(rawWho)} ${windowRange}`);
++            identityDiagnostics.editIdentityDiagnosticCount += 1;
++        }
+         if (Number.isFinite(wantCx)) cx = snapToPeak(wantCx, sampled0.peaks || []);
+         w.cx = cx;
+         w.cy = cy;

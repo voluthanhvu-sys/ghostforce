@@ -1,0 +1,40 @@
+diff --git a/server/ffmpeg-diagnostics.js b/server/ffmpeg-diagnostics.js
+index 26404fa..dd9e03e 100644
+--- a/server/ffmpeg-diagnostics.js
++++ b/server/ffmpeg-diagnostics.js
+@@ -1,11 +1,13 @@
+-const FFMPEG_ERROR_PATTERN = /error|invalid|unable|failed|undefined|no such|option|expression|parse|filter|crop/i;
++const FFMPEG_ERROR_PATTERN = /\b(?:error|invalid|unable|failed|expression|parse|parsing|undefined|no such|option|cannot|could not)\b/i;
++const FFMPEG_BANNER_PATTERN = /^(?:libavutil|libavcodec|libavformat|libavdevice|libavfilter|libswscale|libswresample)\b/i;
+ 
+ export const firstMeaningfulFfmpegError = (stderr) => {
+     const lines = String(stderr || '')
+         .split(/\r?\n/)
+         .map((line) => line.trim())
+         .filter(Boolean);
+-    return lines.find((line) => FFMPEG_ERROR_PATTERN.test(line))
+-        || lines.at(-1)
++    const diagnosticLines = lines.filter((line) => !FFMPEG_BANNER_PATTERN.test(line));
++    return diagnosticLines.find((line) => FFMPEG_ERROR_PATTERN.test(line))
++        || diagnosticLines.at(-1)
+         || 'ffmpeg failed without stderr output';
+ };
+diff --git a/tests/ffmpeg-diagnostics.test.js b/tests/ffmpeg-diagnostics.test.js
+index 8b02eb8..35b0aac 100644
+--- a/tests/ffmpeg-diagnostics.test.js
++++ b/tests/ffmpeg-diagnostics.test.js
+@@ -5,11 +5,12 @@ import { firstMeaningfulFfmpegError } from '../server/ffmpeg-diagnostics.js';
+ test('firstMeaningfulFfmpegError returns the earliest useful error line', () => {
+     const stderr = [
+         'ffmpeg version 7.1',
++        'libavfilter    12.  1.101 / 12.  1.101',
+         'frame=  42 fps=30 time=00:00:01.40 speed=1x',
+-        'Error when evaluating the expression x',
++        'Error when evaluating expression x',
+         'Failed to configure input pad',
+     ].join('\n');
+-    assert.equal(firstMeaningfulFfmpegError(stderr), 'Error when evaluating the expression x');
++    assert.equal(firstMeaningfulFfmpegError(stderr), 'Error when evaluating expression x');
+ });
+ 
+ test('firstMeaningfulFfmpegError ignores irrelevant progress lines', () => {

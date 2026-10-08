@@ -1,0 +1,33 @@
+diff --git "a/server/editor-plan.js" "b/server/editor-plan.js"
+index ee0fa54..270a860 100644
+--- "a/server/editor-plan.js"
++++ "b/server/editor-plan.js"
+@@ -122,6 +122,7 @@ FRAMING — required. 9:16 mix of WIDE vs CLOSE. Re-evaluate framing often, but
+ 1) frames[] covers the WHOLE episode, no gaps. Same source timestamps as start/end.
+    DETAIL VISUAL SHOT SEGMENTATION: independently watch the video for every meaningful visual shot boundary: hard cut, camera-angle change, composition change, reaction shot, subject-layout change, insert/object shot, or focal-subject change.
+    Whenever such a meaningful visual boundary occurs, start a NEW frames[] window and independently classify that new shot as FILL or CONTAIN. The mode may remain the same across the boundary: same mode does NOT mean same shot, and same story/context does NOT mean same shot. Never merge visually distinct shots merely because their framing mode is unchanged.
++   DETAIL DIALOGUE SEGMENTATION: one frames[] window represents ONE visually continuous shot/composition, never an entire conversation, topic, or story beat. During dialogue, every new camera angle, visible speaker-focus change, reaction shot, composition/layout change, or cut to another puppet/person MUST start a new frames[] window even when the topic is unchanged, the mode remains the same, or everyone remains in the same room. Never use "back-and-forth argument", "conversation continues", or "group discussion" to justify one window spanning multiple visually distinct shots. For multi-shot dialogue, independently classify EACH shot as FILL or CONTAIN.
+    Candidate sceneCuts are supplementary trusted anchors for obvious cuts, not an exhaustive boundary list. Also identify meaningful visual/composition boundaries that are NOT listed in sceneCuts; visual segmentation must not depend solely on those hints.
+    Boundaries must come from observed visual changes. Do not use fixed-duration slicing, arbitrary segmentation, forced alternation, a target window count, or a target FILL/CONTAIN percentage.
+    contain = WIDE (full 16:9 small in 9:16 + blur bars). Use CONTAIN for crowds, inserts, CCTV/laptop/poster/calendar views, prop-only shots, source shots already visually tight, or whenever cropping would lose relevant visual information.
+diff --git "a/tests/editor-plan.test.js" "b/tests/editor-plan.test.js"
+index ae02ea2..02cc82d 100644
+--- "a/tests/editor-plan.test.js"
++++ "b/tests/editor-plan.test.js"
+@@ -86,6 +86,16 @@ test('detail guidance requires Gemini to self-segment observed visual shots', ()
+   assert.match(guidance, /Never merge visually distinct shots merely because their framing mode is unchanged/i);
+ });
+ 
++test('detail dialogue uses one framing window per continuous visual shot', () => {
++  const guidance = detailSemanticFramingGuidance();
++  assert.match(guidance, /one frames\[\] window represents ONE visually continuous shot\/composition/i);
++  assert.match(guidance, /never an entire conversation, topic, or story beat/i);
++  assert.match(guidance, /new camera angle, visible speaker-focus change, reaction shot, composition\/layout change, or cut to another puppet\/person MUST start a new frames\[\] window/i);
++  assert.match(guidance, /"back-and-forth argument", "conversation continues", or "group discussion"/i);
++  assert.match(guidance, /independently classify EACH shot as FILL or CONTAIN/i);
++  assert.doesNotMatch(guidance, /maximum CONTAIN duration|target FILL ratio/i);
++});
++
+ test('detail scene-cut hints remain non-mandatory re-evaluation points', () => {
+   const guidance = `${detailSemanticFramingGuidance()}${detailSceneCutGuidance([4.2], 10)}`;
+   assert.match(guidance, /Candidate visual shot boundaries.*4\.2/);

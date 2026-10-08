@@ -1,0 +1,102 @@
+diff --git "a/ghostforge-server.js" b/ghostforge-server.js
+index 3182e73..6f0284e 100644
+--- "a/ghostforge-server.js"
++++ b/ghostforge-server.js
+@@ -58,6 +58,12 @@ function writeEditPartHistory(manifest) {
+     fs.renameSync(tempFile, editPartHistoryFile);
+ }
+ 
++const shortPromptHash = (value) => crypto
++    .createHash('sha256')
++    .update(String(value || ''), 'utf8')
++    .digest('hex')
++    .slice(0, 8);
++
+ let encoderCaps = null;
+ 
+ const ffmpegEnv = { ...process.env, CUDA_VISIBLE_DEVICES: '0' };
+@@ -3505,6 +3511,7 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                     );
+                     send('log', { message: `[EDIT] Detail PLAN ${ordinal}: ${pieceCount} piece${pieceCount === 1 ? '' : 's'} · local ${detailDuration.toFixed(1)}s` });
+                     send('log', { message: `[EDIT] Detail PLAN ${ordinal}: ${detailSceneCuts.length} candidate scene cuts` });
++                    send('log', { message: `[EDIT] Detail settings ${ordinal}: model=${model} promptHash=${shortPromptHash(userPrompt)} sceneCuts=${detailSceneCuts.length}` });
+ 
+                     const detailProxyStartedAt = Date.now();
+                     try {
+@@ -3849,13 +3856,16 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+             && (partTo === 0 || partTo >= plan.segments.length);
+         if (completedWholeRun) {
+             writeEditPartHistory({
+-                version: 1,
++                version: 2,
+                 id: crypto.randomBytes(12).toString('hex'),
+                 completedAt: new Date().toISOString(),
+                 sourcePath: path.resolve(job.inputPath),
+                 sourceName: String(job.originalName || path.basename(job.inputPath)),
+                 sourceWidth: Number(probe.width) || 0,
+                 sourceHeight: Number(probe.height) || 0,
++                model,
++                userPrompt,
++                encoderMode: requestedEncoder,
+                 parts: cutSegs.map((part) => ({
+                     partIndex: part.partIndex,
+                     name: part.name,
+@@ -3926,12 +3936,26 @@ app.post('/api/edit/part-test', (req, res) => {
+         let inputPath;
+         let originalName;
+         let segment;
++        let replaySettingsSource = 'current UI fallback';
++        let replayModel = String(req.body?.model || 'gemini-3.8-flash');
++        let replayPrompt = String(req.body?.prompt || '');
++        let replayEncoderMode = String(req.body?.encoderMode || 'auto');
+         if (history && history.id === requestedHistoryId) {
+             const persistedPart = history.parts.find((part) => Number(part.partIndex) === requestedPartIndex);
+             if (!persistedPart) return res.status(404).json({ error: 'Persisted part was not found' });
+             inputPath = history.sourcePath;
+             originalName = history.sourceName;
+             segment = persistedPart;
++            const hasPersistedAiSettings = typeof history.model === 'string'
++                && typeof history.userPrompt === 'string';
++            if (hasPersistedAiSettings) {
++                replayModel = history.model;
++                replayPrompt = history.userPrompt;
++                replayEncoderMode = typeof history.encoderMode === 'string'
++                    ? history.encoderMode
++                    : replayEncoderMode;
++                replaySettingsSource = 'persisted full-run settings';
++            }
+         } else {
+             const parentPart = jobs.get(String(req.body?.partJobId || ''));
+             if (!parentPart || parentPart.kind !== 'edit-part') {
+@@ -3955,11 +3979,12 @@ app.post('/api/edit/part-test', (req, res) => {
+             originalName,
+             segment: { ...segment, ranges },
+             partIndex: Math.max(1, Number(segment.partIndex) || 1),
++            replaySettingsSource,
+             settings: {
+                 apiKey: String(req.body?.apiKey || ''),
+-                model: String(req.body?.model || 'gemini-3.8-flash'),
+-                prompt: String(req.body?.prompt || ''),
+-                encoderMode: String(req.body?.encoderMode || 'auto'),
++                model: replayModel,
++                prompt: replayPrompt,
++                encoderMode: replayEncoderMode,
+             },
+             status: 'pending',
+         });
+@@ -3997,6 +4022,7 @@ app.get('/api/edit/part-test/stream/:jobId', async (req, res) => {
+ 
+     try {
+         send('log', { message: `[EDIT] TARGETED PART TEST: Part ${partIndex} · original source · ${rangeText}` });
++        send('log', { message: `[EDIT] TARGETED replay settings source: ${job.replaySettingsSource || 'current UI fallback'}` });
+         const sourceProbe = await probeMedia(job.inputPath);
+         send('log', { message: `[EDIT] Target source ${sourceProbe.width}x${sourceProbe.height} · pieces ${rangeText}` });
+         if (!(sourceProbe.width > sourceProbe.height)) {
+@@ -4007,6 +4033,7 @@ app.get('/api/edit/part-test/stream/:jobId', async (req, res) => {
+         const excerptProbe = await probeMedia(excerptPath);
+         const duration = Number(excerptProbe.durationSec) || ranges.reduce((sum, [a, b]) => sum + b - a, 0);
+         const sceneCuts = compactSceneCutHints(await detectSceneTimes(excerptPath, duration, job), duration);
++        send('log', { message: `[EDIT] TARGETED Detail settings Part ${partIndex}: model=${model} promptHash=${shortPromptHash(userPrompt)} sceneCuts=${sceneCuts.length}` });
+ 
+         const proxyStartedAt = Date.now();
+         await runEditEncode([

@@ -1,0 +1,47 @@
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -2048,15 +2048,24 @@
+     });
+ });
+ 
+-async function extractDetailEvidenceJpegs(mediaPath, evidenceEvents, job) {
++async function extractDetailEvidenceJpegs(mediaPath, evidenceEvents, job, onLog) {
+     const frames = [];
+-    for (const event of Array.isArray(evidenceEvents) ? evidenceEvents : []) {
++    const requested = Array.isArray(evidenceEvents) ? evidenceEvents : [];
++    for (const event of requested) {
+         if (job?.cancelled) throw new Error('cancelled');
+         const t = Number(event?.t);
+         if (!Number.isFinite(t) || t < 0) continue;
+-        const jpeg = await extractDetailJpegFrame(mediaPath, t, job);
+-        frames.push({ t, reasons: Array.isArray(event.reasons) ? [...event.reasons] : [], jpeg });
+-    }
++        try {
++            const jpeg = await extractDetailJpegFrame(mediaPath, t, job);
++            frames.push({ t, reasons: Array.isArray(event.reasons) ? [...event.reasons] : [], jpeg });
++        } catch (err) {
++            const message = err instanceof Error ? err.message : String(err);
++            if (job?.cancelled || /cancell/i.test(message)) throw err;
++            onLog?.(`[EDIT] Hybrid evidence JPEG skip @ ${t.toFixed(3)}s: ${message}`.slice(0, 220));
++        }
++    }
++    onLog?.(`[EDIT] Hybrid evidence JPEGs: ${frames.length} usable / ${requested.length} requested`);
++    if (frames.length < 12) throw new Error(`Hybrid evidence has only ${frames.length}/${requested.length} usable JPEGs (minimum 12)`);
+     return frames;
+ }
+ 
+@@ -3693,8 +3702,12 @@
+                                 words: partWords,
+                                 diarTurns: partTurns,
+                             });
+-                            const evidenceFrames = await extractDetailEvidenceJpegs(detailMedia, evidenceEvents, job);
+-                            if (!evidenceFrames.length) throw new Error('no JPEG evidence frames');
++                            const evidenceFrames = await extractDetailEvidenceJpegs(
++                                detailMedia,
++                                evidenceEvents,
++                                job,
++                                (message) => send('log', { message }),
++                            );
+                             send('log', { message: `[EDIT] Hybrid Detail ${ordinal} evidence: ${evidenceFrames.length} frames` });
+                             const evidenceText = JSON.stringify({
+                                 part: {

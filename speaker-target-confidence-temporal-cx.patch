@@ -1,0 +1,73 @@
+--- a/server/local-listen-map.js
++++ b/server/local-listen-map.js
+@@ -88,11 +88,9 @@ export const mapDiarizationEvidence = (turns, intervals, ranges, onDiagnostic)
+           }
+           localOverrides += 1;
+         }
+-      } else if (globalWho) {
+-        mappedTurns.push({ ...turn, who: globalWho });
+       } else {
+-        if (turnScore.total > 0) ambiguousTurns.push(turn);
++        ambiguousTurns.push(turn);
++        firstAmbiguousSpeaker ||= speakerId;
+       }
+     }
+   }
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -2284,13 +2284,18 @@ const splitFillOnSpeaker = (windows, track) => {
+     return out;
+ };
+ 
+-const cxForWhoAt = (who, t, track, fallback) => {
++const cxForWhoAt = (who, t, track, fallback, window) => {
+     const name = String(who || '').toLowerCase().trim();
+     if (!name || !Array.isArray(track) || !track.length) return fallback;
++    const windowStart = Number(window?.a);
++    const windowEnd = Number(window?.b);
+     const pts = track.filter((p) => {
+         if (!isSpeakerIdentity(p.who)) return false;
++        if (!Number.isFinite(p.t)) return false;
++        if (Number.isFinite(windowStart) && Number.isFinite(windowEnd)
++            && (p.t < windowStart - 0.25 || p.t > windowEnd + 0.25)) return false;
+         const w = String(p.who || '').toLowerCase();
+         return w && (w === name || w.includes(name) || name.includes(w));
+     });
+@@ -2302,7 +2307,7 @@ const cxForWhoAt = (who, t, track, fallback) => {
+         const d = Math.abs((Number(p.t) || 0) - t);
+         if (d < bd) { bd = d; best = p; }
+     }
+-    return Number.isFinite(best.cx) ? best.cx : fallback;
++    return bd <= 1.5 && Number.isFinite(best.cx) ? best.cx : fallback;
+ };
+ 
+ const buildSeatLock = (speech, track) => {
+@@ -2473,7 +2478,7 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrac
+         const tLock = Math.max(0.04, w.a + 0.04);
+         const speakerWho = resolveSpeakerWho({ windowWho: w.who }) || '';
+         const displayLabel = speakerWho || w.why || '';
+-        const nowCx = cxForWhoAt(speakerWho, tLock, track, NaN);
++        const nowCx = cxForWhoAt(speakerWho, tLock, track, NaN, w);
+         const lineCx = Number.isFinite(w.cx) ? w.cx : NaN;
+         const locked = seatCx(speakerWho, seats, NaN);
+         const wantCx = [lineCx, nowCx, locked].find((v) => Number.isFinite(v));
+@@ -2526,7 +2531,7 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrac
+                     onLog?.(`[EDIT]   fill ends ${t.toFixed(1)}s → wide (no puppet)`);
+                     break;
+                 }
+-                const now2 = cxForWhoAt(speakerWho, t, track, NaN);
++                const now2 = cxForWhoAt(speakerWho, t, track, NaN, w);
+                 const hold = Number.isFinite(now2) ? now2 : seatCx(speakerWho, seats, cx);
+                 const cx2 = snapToPeak(hold, mid.peaks);
+                 if (Math.abs(cx2 - cx) > 0.18) {
+--- a/CURRENT_STATE.md
++++ b/CURRENT_STATE.md
+@@ -13,6 +13,8 @@ Last handoff refresh: 2026-09-21.
+ ## Active complexity / risk areas
+ The largest risk remains `ghostforge-server.js`: AI transport, media orchestration and feature-specific rendering are tightly coupled there. `src/ghostforge-app.tsx` is also still a large stateful UI. Refactor these only along feature boundaries with regression coverage.
+ 
++Speaker targeting now requires clear per-turn identity evidence and temporally local PLAN cx hints; real Part 3 validation is still pending.
++
+ The repository contains many `.patch` and `investigate-*.txt` artifacts from prior targeted investigations. Treat them as historical/debug evidence, not automatically as the current source of truth. Current `.js/.tsx/.py` code wins when documentation or old patches disagree.
+ 
+ ## Handoff rule

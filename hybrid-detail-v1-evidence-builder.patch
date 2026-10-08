@@ -1,0 +1,252 @@
+warning: in the working copy of 'server/detail-evidence.js', LF will be replaced by CRLF the next time Git touches it
+diff --git a/server/detail-evidence.js b/server/detail-evidence.js
+new file mode 100644
+index 0000000..506054f
+--- /dev/null
++++ b/server/detail-evidence.js
+@@ -0,0 +1,142 @@
++const finite = (value) => Number.isFinite(Number(value));
++
++const validPieces = (part = {}) => {
++  const source = Array.isArray(part.pieces) && part.pieces.length
++    ? part.pieces
++    : (Array.isArray(part.ranges) && part.ranges.length ? part.ranges : [[part.start, part.end]]);
++  return source.map((piece) => {
++    const start = Number(Array.isArray(piece) ? piece[0] : piece?.start);
++    const end = Number(Array.isArray(piece) ? piece[1] : piece?.end);
++    return { start, end };
++  }).filter((piece) => finite(piece.start) && finite(piece.end) && piece.end > piece.start);
++};
++
++const mapSourceIntervalsToPart = (part, items, readStart, readEnd, project) => {
++  const pieces = validPieces(part);
++  const out = [];
++  let offset = 0;
++  for (const piece of pieces) {
++    const pieceDuration = piece.end - piece.start;
++    for (const item of Array.isArray(items) ? items : []) {
++      const itemStart = Number(readStart(item));
++      const itemEnd = Number(readEnd(item));
++      if (!finite(itemStart) || !finite(itemEnd) || itemEnd <= itemStart) continue;
++      const clippedStart = Math.max(piece.start, itemStart);
++      const clippedEnd = Math.min(piece.end, itemEnd);
++      if (clippedEnd <= clippedStart) continue;
++      out.push(project(item, offset + clippedStart - piece.start, offset + clippedEnd - piece.start));
++    }
++    offset += pieceDuration;
++  }
++  return out.sort((a, b) => (a.t ?? a.start) - (b.t ?? b.start));
++};
++
++export const mapWordsToPartTimeline = (part, words) => mapSourceIntervalsToPart(
++  part,
++  words,
++  (word) => word?.t ?? word?.start,
++  (word) => word?.end,
++  (word, t, end) => ({ ...word, t, end }),
++);
++
++export const mapDiarizationToPartTimeline = (part, turns) => mapSourceIntervalsToPart(
++  part,
++  turns,
++  (turn) => turn?.start,
++  (turn) => turn?.end,
++  (turn, start, end) => ({ start, end, speakerId: String(turn?.speakerId || '') }),
++).filter((turn) => turn.speakerId);
++
++const addReason = (events, duration, time, reason) => {
++  const t = Number(time);
++  if (!finite(t) || !finite(duration) || duration <= 0) return;
++  const safe = Math.min(Math.max(0, t), Math.max(0, duration - 0.001));
++  events.push({ t: safe, reason });
++};
++
++const speechRuns = (words, gap) => {
++  const valid = (Array.isArray(words) ? words : []).map((word) => ({
++    start: Number(word?.t ?? word?.start),
++    end: Number(word?.end),
++  })).filter((word) => finite(word.start) && finite(word.end) && word.end > word.start)
++    .sort((a, b) => a.start - b.start || a.end - b.end);
++  const runs = [];
++  for (const word of valid) {
++    const last = runs[runs.length - 1];
++    if (!last || word.start - last.end > gap) runs.push({ ...word });
++    else last.end = Math.max(last.end, word.end);
++  }
++  return runs;
++};
++
++const mergeNearbyEvents = (events, epsilon) => {
++  const sorted = events.sort((a, b) => a.t - b.t || a.reason.localeCompare(b.reason));
++  const merged = [];
++  for (const event of sorted) {
++    const last = merged[merged.length - 1];
++    if (last && event.t - last.t <= epsilon) {
++      if (!last.reasons.includes(event.reason)) last.reasons.push(event.reason);
++      continue;
++    }
++    merged.push({ t: event.t, reasons: [event.reason] });
++  }
++  return merged;
++};
++
++export const buildDetailEvidenceTimes = ({
++  duration,
++  sceneCuts = [],
++  words = [],
++  diarTurns = [],
++  eventOffset = 0.2,
++  dialogueGap = 0.75,
++  dedupeEpsilon = 0.12,
++  maxObservationGap = 6,
++} = {}) => {
++  const dur = Number(duration);
++  if (!finite(dur) || dur <= 0) return [];
++  const events = [];
++  addReason(events, dur, Math.min(0.05, dur / 2), 'part-start');
++  addReason(events, dur, dur - Math.min(0.05, dur / 2), 'part-end');
++
++  for (const rawCut of Array.isArray(sceneCuts) ? sceneCuts : []) {
++    const cut = Number(rawCut);
++    if (!finite(cut) || cut <= 0 || cut >= dur) continue;
++    addReason(events, dur, cut - eventOffset, 'scene-cut-before');
++    addReason(events, dur, cut + eventOffset, 'scene-cut-after');
++  }
++
++  const turns = (Array.isArray(diarTurns) ? diarTurns : []).map((turn) => ({
++    start: Number(turn?.start),
++    end: Number(turn?.end),
++    speakerId: String(turn?.speakerId || ''),
++  })).filter((turn) => finite(turn.start) && finite(turn.end) && turn.end > turn.start && turn.speakerId)
++    .sort((a, b) => a.start - b.start || a.end - b.end);
++  for (let i = 1; i < turns.length; i += 1) {
++    if (turns[i - 1].speakerId === turns[i].speakerId) continue;
++    const transition = Math.max(turns[i].start, Math.min(turns[i - 1].end, turns[i].start));
++    addReason(events, dur, transition - eventOffset, 'speaker-change-before');
++    addReason(events, dur, transition, 'speaker-change');
++    addReason(events, dur, transition + eventOffset, 'speaker-change-after');
++  }
++
++  for (const run of speechRuns(words, dialogueGap)) {
++    addReason(events, dur, run.start, 'dialogue-start');
++    addReason(events, dur, run.end, 'dialogue-end');
++  }
++
++  let merged = mergeNearbyEvents(events, dedupeEpsilon);
++  const safety = [];
++  for (let i = 1; i < merged.length; i += 1) {
++    const left = merged[i - 1].t;
++    const right = merged[i].t;
++    const gap = right - left;
++    if (gap <= maxObservationGap) continue;
++    const count = Math.ceil(gap / maxObservationGap) - 1;
++    const step = gap / (count + 1);
++    for (let j = 1; j <= count; j += 1) addReason(safety, dur, left + step * j, 'periodic-safety');
++  }
++  merged = mergeNearbyEvents([...merged.flatMap((event) => event.reasons.map((reason) => ({ t: event.t, reason }))), ...safety], dedupeEpsilon);
++  return merged;
++};
++
+
+warning: in the working copy of 'tests/detail-evidence.test.js', LF will be replaced by CRLF the next time Git touches it
+diff --git a/tests/detail-evidence.test.js b/tests/detail-evidence.test.js
+new file mode 100644
+index 0000000..72fc48c
+--- /dev/null
++++ b/tests/detail-evidence.test.js
+@@ -0,0 +1,95 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {
++  buildDetailEvidenceTimes,
++  mapDiarizationToPartTimeline,
++  mapWordsToPartTimeline,
++} from '../server/detail-evidence.js';
++
++test('maps words into a contiguous part-local timeline', () => {
++  const words = mapWordsToPartTimeline({ start: 10, end: 20 }, [{ word: 'hi', t: 12, end: 12.4 }]);
++  assert.equal(words[0].word, 'hi');
++  assert.equal(words[0].t, 2);
++  assert(Math.abs(words[0].end - 2.4) < 1e-9);
++});
++
++test('maps words in piece two after the accumulated first piece duration', () => {
++  const part = { pieces: [{ start: 10, end: 15 }, { start: 40, end: 50 }] };
++  const words = mapWordsToPartTimeline(part, [{ word: 'two', t: 42, end: 42.5 }]);
++  assert.deepEqual(words, [{ word: 'two', t: 7, end: 7.5 }]);
++});
++
++test('maps anonymous diarization turns and clips a turn at piece boundaries', () => {
++  const part = { pieces: [{ start: 10, end: 15 }, { start: 40, end: 45 }] };
++  const turns = mapDiarizationToPartTimeline(part, [
++    { start: 11, end: 12, speakerId: 'SPEAKER_00' },
++    { start: 14, end: 41, speakerId: 'SPEAKER_01' },
++  ]);
++  assert.deepEqual(turns, [
++    { start: 1, end: 2, speakerId: 'SPEAKER_00' },
++    { start: 4, end: 5, speakerId: 'SPEAKER_01' },
++    { start: 5, end: 6, speakerId: 'SPEAKER_01' },
++  ]);
++  assert.equal(turns.some((turn) => 'who' in turn), false);
++});
++
++test('samples before and after scene cuts', () => {
++  const samples = buildDetailEvidenceTimes({ duration: 10, sceneCuts: [5] });
++  assert(samples.some((sample) => Math.abs(sample.t - 4.8) < 1e-9 && sample.reasons.includes('scene-cut-before')));
++  assert(samples.some((sample) => Math.abs(sample.t - 5.2) < 1e-9 && sample.reasons.includes('scene-cut-after')));
++});
++
++test('samples anonymous speaker-cluster transitions', () => {
++  const samples = buildDetailEvidenceTimes({
++    duration: 10,
++    diarTurns: [
++      { start: 1, end: 4, speakerId: 'SPEAKER_00' },
++      { start: 4, end: 8, speakerId: 'SPEAKER_01' },
++    ],
++  });
++  const transition = samples.find((sample) => Math.abs(sample.t - 4) < 1e-9);
++  assert(transition?.reasons.includes('speaker-change'));
++});
++
++test('groups nearby words and samples dialogue-run boundaries', () => {
++  const samples = buildDetailEvidenceTimes({
++    duration: 12,
++    words: [
++      { word: 'a', t: 2, end: 2.2 },
++      { word: 'b', t: 2.5, end: 2.8 },
++      { word: 'c', t: 5, end: 5.3 },
++    ],
++  });
++  assert(samples.some((sample) => sample.t === 2 && sample.reasons.includes('dialogue-start')));
++  assert(samples.some((sample) => sample.t === 2.8 && sample.reasons.includes('dialogue-end')));
++  assert(samples.some((sample) => sample.t === 5 && sample.reasons.includes('dialogue-start')));
++});
++
++test('periodic safety samples fill only long remaining observation gaps', () => {
++  const samples = buildDetailEvidenceTimes({ duration: 20 });
++  assert(samples.some((sample) => sample.reasons.includes('periodic-safety')));
++  assert(Math.max(...samples.slice(1).map((sample, i) => sample.t - samples[i].t)) <= 6.001);
++});
++
++test('nearby event requests deduplicate and retain reasons', () => {
++  const samples = buildDetailEvidenceTimes({ duration: 10, sceneCuts: [5], words: [{ word: 'x', t: 4.82, end: 5.18 }] });
++  assert(samples.length < 8);
++  assert(samples.some((sample) => sample.reasons.includes('scene-cut-before') && sample.reasons.includes('dialogue-start')));
++});
++
++test('evidence timestamps are deterministic, sorted, finite and in bounds', () => {
++  const input = {
++    duration: 13,
++    sceneCuts: [3, Number.NaN, 8],
++    words: [{ word: 'x', t: 1, end: 1.2 }],
++    diarTurns: [
++      { start: 0, end: 6, speakerId: 'SPEAKER_00' },
++      { start: 6, end: 13, speakerId: 'SPEAKER_01' },
++    ],
++  };
++  const first = buildDetailEvidenceTimes(input);
++  const second = buildDetailEvidenceTimes(input);
++  assert.deepEqual(first, second);
++  assert(first.every((sample) => Number.isFinite(sample.t) && sample.t >= 0 && sample.t < input.duration));
++  assert(first.every((sample, i) => i === 0 || sample.t > first[i - 1].t));
++});

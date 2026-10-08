@@ -1,0 +1,2 @@
+export const safeFileName=(raw:string)=>{ const base=raw.split(/[/\\]/).pop()||'video.mp4'; const cleaned=base.replace(/[<>:"|?*]/g,' ').replace(/-{2,}/g,' ').replace(/\s+/g,' ').trim().replace(/^\.+/,'')||'video.mp4'; return /\.(mp4|mov|webm|m4v)$/i.test(cleaned)?cleaned.replace(/\.(mov|webm|m4v)$/i,'.mp4'):`${cleaned}.mp4`; };
+export const newClipId=()=>typeof crypto!=='undefined'&&crypto.randomUUID?crypto.randomUUID():`q-${Date.now()}-${Math.random().toString(36).slice(2,10)}`;

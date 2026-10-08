@@ -1,0 +1,35 @@
+diff --git "a/server/editor-plan.js" "b/server/editor-plan.js"
+index 6fab10e..06e4cf8 100644
+--- "a/server/editor-plan.js"
++++ "b/server/editor-plan.js"
+@@ -131,6 +131,9 @@ FRAMING — required. 9:16 mix of WIDE vs CLOSE. Re-evaluate framing often, but
+    The mere presence of another person, prop/object, background context, movement, reaction, or spatial context is NOT enough by itself to require CONTAIN. Use CONTAIN only when losing it would materially hurt understanding of the action, joke, reaction, relationship, reveal, or visual beat.
+    TWO-SHOT: the two-shot alone determines neither mode. Use FILL when one person is clearly focal, the second person is not needed to understand the beat, and a reasonable crop preserves the meaning. Use CONTAIN when both expressions/actions are simultaneously necessary, their interaction is the beat/joke, important action spans both sides, or the crop would materially remove needed information.
+    REACTION: use FILL for an isolated reaction when the reacting subject is clearly focal. Use CONTAIN when the reaction and its cause/action must be visible together to understand the moment.
++   DIALOGUE GUARD: in normal dialogue with 1–2 visible puppets, FILL the speaking/focal puppet when a useful medium crop exists; do not mark the whole interaction CONTAIN merely because another puppet is visible. With 3 visible puppets, generally FILL the active speaker when a useful medium crop exists; three puppets alone is NOT sufficient reason for CONTAIN.
++   WIDE-ONLY EXCEPTIONS: reserve CONTAIN for genuine wide/context needs such as a crowd or many puppets whose necessary context would be lost, an establishing/context shot, CCTV/laptop/poster/calendar/prop-only insert, a genuinely off-camera speaker, or a source shot already so tight that further cropping is harmful.
++   ANTI-DEGENERATE CHECK: do NOT return an all-CONTAIN plan for a normal dialogue segment. All-CONTAIN is allowed only when essentially the entire segment genuinely consists of the WIDE-ONLY EXCEPTIONS above. Before returning JSON, if frames[] contains zero FILL windows, re-check whether the segment truly qualifies as wide-only; if ordinary visible dialogue exists, create the appropriate FILL window(s).
+    At EVERY candidate scene cut, make a fresh independent framing classification for the new shot itself. Do not inherit CONTAIN merely because the story or context is similar. The mode may remain the same across the cut only because the new shot independently satisfies the same decision. This requires fresh classification, not a mandatory FILL, CONTAIN, mode change, or split.
+    HARD: speaker is NOT in this camera shot → CONTAIN.
+    HARD: chips / cups / bottles / roulette / signage / black empty / calendar paper insert → CONTAIN.
+diff --git "a/tests/editor-plan.test.js" "b/tests/editor-plan.test.js"
+index 4bef5f2..3355b33 100644
+--- "a/tests/editor-plan.test.js"
++++ "b/tests/editor-plan.test.js"
+@@ -57,6 +57,16 @@ test('detail framing uses a semantic information-loss gate without fill quotas',
+   assert.match(guidance, /mere presence of another person, prop\/object, background context, movement, reaction, or spatial context is NOT enough/i);
+ });
+ 
++test('detail framing rejects degenerate all-contain dialogue without a fill quota', () => {
++  const guidance = detailSemanticFramingGuidance();
++  assert.match(guidance, /normal dialogue with 1[–-]2 visible puppets, FILL the speaking\/focal puppet/i);
++  assert.match(guidance, /three puppets alone is NOT sufficient reason for CONTAIN/i);
++  assert.match(guidance, /do NOT return an all-CONTAIN plan for a normal dialogue segment/i);
++  assert.match(guidance, /if frames\[\] contains zero FILL windows, re-check whether the segment truly qualifies as wide-only/i);
++  assert.match(guidance, /crowd or many puppets.*establishing\/context shot.*off-camera speaker/i);
++  assert.doesNotMatch(guidance, /50[–-]65%/);
++});
++
+ test('detail guidance requires Gemini to self-segment observed visual shots', () => {
+   const guidance = detailSemanticFramingGuidance();
+   assert.match(guidance, /independently watch the video for every meaningful visual shot boundary/i);

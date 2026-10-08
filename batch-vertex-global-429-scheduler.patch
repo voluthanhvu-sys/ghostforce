@@ -1,0 +1,236 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -8,7 +8,7 @@ import path from 'path';
+ import os from 'os';
+ import { fileURLToPath } from 'url';
+ import { runProcess } from './server/process.js';
+-import { jobs, subscribeJob, jobSignal, abortJob } from './server/jobs.js';
++import { jobs, subscribeJob, jobSignal, abortJob, ensureAbort } from './server/jobs.js';
+ import { createSaveDirStore } from './server/save-dir.js';
+ import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, normalizeFrameMode, stitchFrames, clamp01, parseFraming, parseSpeakerTrack, snapSpeakerTrack, clampPlan, parseGeminiPlan } from './server/editor-plan.js';
+ 
+@@ -1564,8 +1564,158 @@ const sleepJob = async (ms, job) => {
+ 
+ const isQuotaErr = (msg, status) => status === 429 || /resource exhausted|quota|rate.?limit|too many requests/i.test(String(msg || ''));
+ 
++let vertexQuotaCooldownUntil = 0;
++let vertexPostActive = false;
++let vertexCooldownTimer = null;
++const vertexPostWaiters = [];
++
++const vertexQuotaWaitMs = (attempt) => Math.min(90, 8 + attempt * attempt * 10) * 1000;
++
++const pumpVertexPostWaiters = () => {
++    if (vertexPostActive) return;
++    if (vertexQuotaCooldownUntil > Date.now()) {
++        const waitSec = Math.ceil((vertexQuotaCooldownUntil - Date.now()) / 1000);
++        for (const waiter of vertexPostWaiters) {
++            if (waiter.cooldownLogged) continue;
++            waiter.cooldownLogged = true;
++            waiter.onLog?.(`[EDIT] Shared Vertex cooldown — wait ${waitSec}s…`);
++        }
++        if (vertexCooldownTimer) clearTimeout(vertexCooldownTimer);
++        vertexCooldownTimer = setTimeout(() => {
++            vertexCooldownTimer = null;
++            pumpVertexPostWaiters();
++        }, Math.max(1, vertexQuotaCooldownUntil - Date.now()));
++        return;
++    }
++    while (vertexPostWaiters.length) {
++        const waiter = vertexPostWaiters.shift();
++        if (waiter.job?.cancelled) {
++            waiter.cleanup();
++            waiter.reject(new Error('cancelled'));
++            continue;
++        }
++        if (waiter.deadlineAt > 0 && Date.now() >= waiter.deadlineAt) {
++            waiter.cleanup();
++            waiter.reject(waiter.deadlineError());
++            continue;
++        }
++        vertexPostActive = true;
++        waiter.cleanup();
++        if (waiter.cooldownLogged) waiter.onLog?.('[EDIT] Shared Vertex cooldown finished — resuming…');
++        let released = false;
++        waiter.resolve(() => {
++            if (released) return;
++            released = true;
++            vertexPostActive = false;
++            pumpVertexPostWaiters();
++        });
++        return;
++    }
++};
++
++const acquireVertexPostSlot = (job, onLog, opts = {}) => new Promise((resolve, reject) => {
++    if (job?.cancelled) return reject(new Error('cancelled'));
++    const deadlineAt = Number(opts.deadlineAt) || 0;
++    const deadlineError = typeof opts.deadlineError === 'function'
++        ? opts.deadlineError
++        : () => new Error('Vertex request deadline reached');
++    if (deadlineAt > 0 && Date.now() >= deadlineAt) return reject(deadlineError());
++    if (vertexPostActive || vertexPostWaiters.length) onLog?.('[EDIT] Waiting for shared Vertex request slot…');
++    let deadlineTimer = null;
++    let abortSignal = null;
++    const waiter = {
++        job,
++        deadlineAt,
++        deadlineError,
++        onLog,
++        cooldownLogged: false,
++        resolve,
++        reject,
++        cleanup: () => {
++            if (deadlineTimer) clearTimeout(deadlineTimer);
++            if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
++        },
++    };
++    const removeWaiter = () => {
++        const i = vertexPostWaiters.indexOf(waiter);
++        if (i >= 0) vertexPostWaiters.splice(i, 1);
++    };
++    const onAbort = () => {
++        removeWaiter();
++        waiter.cleanup();
++        reject(new Error('cancelled'));
++        pumpVertexPostWaiters();
++    };
++    if (job) {
++        abortSignal = ensureAbort(job).signal;
++        abortSignal.addEventListener('abort', onAbort, { once: true });
++    }
++    if (deadlineAt > 0) {
++        deadlineTimer = setTimeout(() => {
++            removeWaiter();
++            waiter.cleanup();
++            reject(job?.cancelled ? new Error('cancelled') : deadlineError());
++            pumpVertexPostWaiters();
++        }, Math.max(1, deadlineAt - Date.now()));
++    }
++    vertexPostWaiters.push(waiter);
++    pumpVertexPostWaiters();
++});
++
++const waitForVertexCooldown = async (job, onLog, opts = {}) => {
++    let logged = false;
++    while (vertexQuotaCooldownUntil > Date.now()) {
++        if (job?.cancelled) throw new Error('cancelled');
++        const deadlineAt = Number(opts.deadlineAt) || 0;
++        const deadlineError = typeof opts.deadlineError === 'function'
++            ? opts.deadlineError
++            : () => new Error('Vertex request deadline reached');
++        const cooldownMs = vertexQuotaCooldownUntil - Date.now();
++        const deadlineMs = deadlineAt > 0 ? deadlineAt - Date.now() : Infinity;
++        if (deadlineMs <= 0) throw deadlineError();
++        if (!logged) {
++            onLog?.(`[EDIT] Shared Vertex cooldown — wait ${Math.ceil(cooldownMs / 1000)}s…`);
++            logged = true;
++        }
++        await sleepJob(Math.min(cooldownMs, deadlineMs), job);
++    }
++    if (logged) onLog?.('[EDIT] Shared Vertex cooldown finished — resuming…');
++};
++
++const runSerializedVertexPost = async (job, onLog, post, opts = {}) => {
++    while (true) {
++        await waitForVertexCooldown(job, onLog, opts);
++        const release = await acquireVertexPostSlot(job, onLog, opts);
++        if (vertexQuotaCooldownUntil > Date.now()) {
++            release();
++            continue;
++        }
++        try {
++            if (job?.cancelled) throw new Error('cancelled');
++            const result = await post();
++            if (result?.res?.status === 429) {
++                const waitMs = Math.max(0, Number(opts.quotaWaitMs) || 0);
++                vertexQuotaCooldownUntil = Math.max(vertexQuotaCooldownUntil, Date.now() + waitMs);
++                onLog?.(`[EDIT] Shared Vertex cooldown set ${Math.ceil(waitMs / 1000)}s after HTTP 429`);
++            }
++            return result;
++        } finally {
++            release();
++        }
++    }
++};
++
+ const waitQuota = async (job, onLog, attempt) => {
+-    const sec = Math.min(90, 8 + attempt * attempt * 10);
++    const sec = vertexQuotaWaitMs(attempt) / 1000;
+     if (onLog) onLog(`[EDIT] Quota 429 — đợi ${sec}s rồi gọi lại (${attempt}/5). Không bỏ STT.`);
+     await sleepJob(sec * 1000, job);
+ };
+@@ -2578,21 +2728,24 @@ async function vertexGeneratePlan(auth, model, videoPath, userPrompt, duration,
+                 if (attempt > 1) {
+                     if (onLog) onLog(`[EDIT] Vertex retry ${attempt}/3 @ ${loc}…`);
+                     try { auth = await getAdcAuth(); } catch { /* keep token */ }
+-                    await new Promise((r) => setTimeout(r, 2000 * attempt));
++                    await sleepJob(2000 * attempt, job);
+                 }
+-                const res = await fetch(url, {
+-                    method: 'POST',
+-                    headers: {
+-                        Authorization: `Bearer ${auth.token}`,
+-                        'Content-Type': 'application/json',
+-                        'x-goog-user-project': auth.project,
+-                    },
+-                    body,
+-                    signal: jobSignal(job, 15 * 60 * 1000),
+-                });
+-                const j = await res.json().catch(() => ({}));
++                const { res, j } = await runSerializedVertexPost(job, onLog, async () => {
++                    const res = await fetch(url, {
++                        method: 'POST',
++                        headers: {
++                            Authorization: `Bearer ${auth.token}`,
++                            'Content-Type': 'application/json',
++                            'x-goog-user-project': auth.project,
++                        },
++                        body,
++                        signal: jobSignal(job, 15 * 60 * 1000),
++                    });
++                    const j = await res.json().catch(() => ({}));
++                    return { res, j };
++                }, { quotaWaitMs: vertexQuotaWaitMs(attempt) });
+                 if (!res.ok) {
+                     lastErr = j.error?.message || `Vertex ${res.status} @ ${loc}`;
+                     if (isQuotaErr(lastErr, res.status)) {
+@@ -2740,21 +2893,27 @@ async function vertexJsonVideo(auth, model, videoPath, prompt, job, onLog, opts
+                     if (remainingMs() <= retryDelayMs) throw deadlineError();
+                     await sleepJob(retryDelayMs, job);
+                 }
+-                const fetchTimeoutMs = Math.max(1, Math.floor(Math.min(timeoutMs, requireRemaining())));
+-                const res = await fetch(url, {
+-                    method: 'POST',
+-                    headers: {
+-                        Authorization: `Bearer ${auth.token}`,
+-                        'Content-Type': 'application/json',
+-                        'x-goog-user-project': auth.project,
+-                    },
+-                    body,
+-                    signal: jobSignal(job, fetchTimeoutMs),
+-                });
+-                const j = await res.json().catch(() => ({}));
++                const { res, j } = await runSerializedVertexPost(job, onLog, async () => {
++                    const fetchTimeoutMs = Math.max(1, Math.floor(Math.min(timeoutMs, requireRemaining())));
++                    const res = await fetch(url, {
++                        method: 'POST',
++                        headers: {
++                            Authorization: `Bearer ${auth.token}`,
++                            'Content-Type': 'application/json',
++                            'x-goog-user-project': auth.project,
++                        },
++                        body,
++                        signal: jobSignal(job, fetchTimeoutMs),
++                    });
++                    const j = await res.json().catch(() => ({}));
++                    return { res, j };
++                }, {
++                    deadlineAt,
++                    deadlineError,
++                    quotaWaitMs: vertexQuotaWaitMs(attempt),
++                });
+                 requireRemaining();
+                 if (!res.ok) {
+                     lastErr = j.error?.message || `Vertex ${res.status} @ ${loc}`;

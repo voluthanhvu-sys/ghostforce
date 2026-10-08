@@ -1,0 +1,128 @@
+INVESTIGATION ONLY — Smart CONTAIN/FILL, EDIT MIXED 9:16
+Không sửa source, không gọi API/video/test.
+
+CURRENT CALL PATH:
+1. `editorSysPrompt()` (ghostforge-server.js:2440-2510) yêu cầu PLAN AI trả `segments[].frames[]` và `track[]` khi `tiktokMix` bật.
+2. `parseGeminiPlan()` (server/editor-plan.js:334-351) giữ JSON gốc ở `_raw`, còn `clampPlan()` tạo mỗi segment với `frames: parseFraming(...)` và `track: parseSpeakerTrack(...)` (249-263).
+3. Sau cắt segment, `speechForSegment()` (ghostforge-server.js:2906-2934) đổi lời thoại toàn clip về thời gian local của part. `mixFrameClip()` được gọi tại 3284-3286 với `seg.frames`, `seg.track`, và `localSpeech`.
+4. `mixFrameClip()` (2144-2319) lấy PLAN frames làm `windows`. Nếu dưới 2 window hợp lệ, nó thay toàn bộ bằng `detectSceneTimes()` + `buildMixWindows()` (2149-2155).
+5. Nó tạo seat fallback, sau đó gọi `applySpeechToWindows(windows, speech)` (2156-2171), rồi `splitFillOnSpeaker()` (1980-2032) chỉ chia các window fill theo PLAN track/sự đổi vị trí.
+6. Chỉ các window fill được RGB lấy mẫu và xác định/snap cx (2172-2245). RGB có thể đổi fill thành contain trong hai điều kiện hẹp: khung không có puppet thật; hoặc là close-up nhưng không có STT who. Nó có thể chấm dứt phần còn lại của fill thành contain khi giữa window không còn puppet.
+7. Nếu tổng fill sau đó thấp hơn 28% duration, force stage (2247-2270) có thể đổi contain có speech thành fill sau kiểm tra RGB.
+8. `containWins`/`fillWins` được chốt ở 2274-2275. Filter graph (2290-2310) render cả contain và fill; `enableContain` overlay contain lên fill trong mọi khoảng contain. Như vậy mode cuối cùng trong `windows` quyết định FFmpeg.
+
+PLAN FRAMING FIELDS:
+- JSON prompt yêu cầu `segments[].frames[]`, mỗi item mẫu `{start,end,mode,why}` và `track[]` item `{t,cx,cy,who}`.
+- Parser còn chấp nhận tên mảng thay thế: `frames`, `framing`, `shots`, `layout` (server/editor-plan.js:123-125).
+- Frame object được dùng: start/from/t0; end/to/t1; mode/kind/framing/type; why/reason; cx/x, cy/y, cx2/x2, cy2/y2 (128-151). Array form dùng `[start,end,mode,why]`.
+- Chỉ mode normalize được, duration >=0.6s được giữ; output window thực tế có `a,b,mode,why,cx,cy,cx2,cy2`. `stitchFrames()` làm tròn, nối/gộp window và kéo frame cuối phủ đến hết part (62-111).
+- `track[]` dùng t/time/start, cx/x, cy/y, who/speaker/name (154-184). Trong mixed pipeline nó được dùng để chia fill và bổ sung vị trí; không trực tiếp đặt mode.
+- Segment giữ: start/end/dur/name/title/titleVi/reason/script/pieces/ranges/frames/track. `plan._raw` vẫn chứa toàn bộ JSON PLAN, kể cả top-level `lines` trong TEST, nhưng flow normal dùng dedicated Speaker AI trước; `_raw` speech chỉ là fallback khi dedicated call lỗi.
+
+CURRENT MODE SEMANTICS:
+- `normalizeFrameMode()` (55-60): `fill|close|tight|crop|cận|zoom` => `fill`; `contain|wide|fit|letter|rộng|full body|establish` => `contain`.
+- Trong renderer, `contain` là 16:9 fit trên nền blur; `fill` là crop vuông 1:1 theo cx/cy đặt trong canvas 9:16 (2290-2310).
+- Vì vậy WIDE == contain và CLOSE == fill sau khi parser normalize. Không có enum mode thứ ba.
+- Prompt cũng nêu rõ `contain = WIDE` và `fill = MEDIUM 1:1`; yêu cầu frames phủ toàn episode, mode mang ý nghĩa biên tập/context chứ không chỉ tọa độ.
+
+EXACT STT→FILL OVERRIDE:
+- `applySpeechToWindows()` tại 2098-2142 là override chính.
+- Nó lọc line có who và >=0.65s, gộp line liên tiếp cùng người, rồi duyệt mọi PLAN window.
+- Chỉ `forcedWhy(w)` ngăn override: reason có cctv, laptop, poster, calendar, already, close-up, prop, chip, bottle, roulette, empty, black, 4+, crowd (2099-2100, 2114-2117).
+- Với mọi window khác có line overlap >0.18s ở đầu/cuối, hàm bỏ mode gốc: gap/tail thành `contain` với why `STT gap`/`STT tail`; phần speech thành `{mode:'fill', who, why, cx, cy}` (2118-2141). Nó không kiểm tra `w.mode === 'contain'`.
+- Override thứ hai là block `fillSec < dur * 0.28` (2247-2270): contain overlap speech có thể bị `w.mode = 'fill'`, trừ khi RGB báo trống hoặc close-up không-two-shot. Đây là đường có thể phá WIDE ngay cả khi override đầu tiên được hạn chế nhưng force stage không được chỉnh tương ứng.
+
+WIDE 40–42 + SPEECH 40–41.5 TRACE:
+- `seg.frames` đã parser thành `{a:40,b:42,mode:'contain',...}`; log WIDE là presentation của mode contain (3127-3132).
+- Nếu `why` không chứa từ khóa `forcedWhy`, `applySpeechToWindows()` có hit Cody. Nó tạo `[40.0,41.5] fill` với Cody/cx/cy của dedicated speech; tail `[41.5,42.0] contain` nếu đủ 0.5s. WIDE ban đầu không còn tồn tại như một window nguyên vẹn.
+- `splitFillOnSpeaker()` chỉ xử lý `[40.0,41.5] fill`; nó có thể chia fill theo PLAN track, không khôi phục contain.
+- RGB lấy mẫu fill. Với dedicated Cody (`named` có giá trị), close-up không tự demote; `twoShot` ở log chỉ là kết quả sample/metadata cho log. Nó không bảo vệ mode trong pass thường.
+- Nếu tổng fill đã >=28% như run ghi 18 close / 2 wide, force stage không chạy. `containWins` chỉ gồm tail 41.5-42.0; FFmpeg render fill trong 40.0-41.5 và contain trong tail. Không có bước sau nào “restore” PLAN WIDE.
+- Nếu tổng fill <28%, force stage có thể còn biến tail contain thành fill nếu speech overlap đủ và RGB cho phép.
+
+CURRENT PRECEDENCE:
+1. PLAN frames khởi tạo mode khi có >=2 window hợp lệ; nếu không, scene/timer fallback thay hoàn toàn PLAN mode.
+2. Dedicated Speaker AI + Google STT timing (`speech`) ghi đè mode PLAN qua `applySpeechToWindows`, trừ `forcedWhy` keyword heuristic.
+3. PLAN track chỉ chia/định vị các window đã là fill; dedicated speech cx hiện được ưu tiên trong fill window.
+4. RGB chỉ refine/cắt vị trí cho fill, và có các demotion/force-fill nêu trên; RGB không biết semantic reason của PLAN.
+5. `containWins`/`fillWins` chốt mode sau toàn bộ các bước trên, FFmpeg chỉ execute mode chốt.
+
+IS CURRENT PLAN SUFFICIENT:
+PARTIAL
+- Có: PLAN đã có mode per-time (`contain`/`fill`) phủ toàn episode theo prompt, và prompt nêu các trường hợp context cần contain (4+ puppet, establishing, prop/insert, source already close-up, speaker off-camera). `why/reason` cũng được parser/lưu.
+- Thiếu: source không giữ cờ “explicit PLAN contain” riêng với contain do STT gap/tail hoặc scene fallback; `why` không có schema/enum context bắt buộc. `forcedWhy` hiện suy luận bằng substring, nên WIDE đúng nhưng why không chứa keyword vẫn bị speech override.
+- Do đó mode PLAN đủ để làm primary decision nếu bảo vệ được provenance của explicit frames; chỉ `why` không đủ tin cậy để làm classifier mới.
+
+OPTION A:
+PLAN mode luôn thắng; speaker chỉ cung cấp who/cx/cy trong PLAN fill.
+- Accuracy framing: tốt nhất cho PLAN WIDE/context có chủ ý; bỏ khả năng sửa PLAN contain sai/lỗi thời gian bằng dedicated speech.
+- Regression: cao hơn ở PLAN contain stale/sparse, speech bắt đầu giữa boundary, hoặc PLAN lỡ để contain cho interaction 1-2 người.
+- Fallback: nếu frames thiếu (<2) scene/timer windows vẫn cần policy riêng; speaker hiện có thể tạo fill trên fallback.
+- Complexity: thấp nếu bỏ speech rewrite cho toàn bộ PLAN windows, nhưng cần xử lý force stage.
+- API/quota: không đổi. AI call mới: không.
+
+OPTION B:
+Chỉ bảo vệ explicit PLAN WIDE/contain. PLAN CLOSE/fill vẫn nhận speaker who/cx/cy; frames thiếu/scene fallback giữ STT behavior hiện tại.
+- Accuracy framing: phù hợp mục tiêu kiến trúc; giữ WIDE intentional/context, vẫn dùng Speaker AI để đặt ai/ở đâu trong fill.
+- Regression: trung bình-thấp. Rủi ro còn lại là PLAN contain sai hoặc overly broad không được STT cứu; đổi lại tránh confirmed override WIDE.
+- Fallback: `windows.length <2` tiếp tục scene/timer + STT; frame PLAN fill vẫn fill, speaker line chỉ xác định target/timing.
+- Complexity: thấp-trung bình vì cần provenance tối thiểu “đây là PLAN frame explicit” và phải khóa cả `applySpeechToWindows` lẫn force-fill stage.
+- API/quota: không đổi. AI call mới: không.
+
+OPTION C:
+Dùng PLAN mode cộng `why`/two-shot/RGB metadata để quyết định STT có được override.
+- Accuracy framing: có thể linh hoạt, nhưng `why` tự do và `twoShot` chỉ là sample RGB, không phải semantic context classifier.
+- Regression: trung bình-cao; dễ tạo heuristic mới không có ground truth, trái yêu cầu không tự phát minh classifier.
+- Complexity: cao hơn B; phải duy trì danh sách keyword/logic mơ hồ.
+- API/quota: không đổi. AI call mới: không.
+
+OPTION D (fallback-safe biến thể của B):
+PLAN mode là primary; explicit `contain` bị protected, explicit `fill` vẫn được speech split/aim. Chỉ scene/timer fallback và interval không có explicit PLAN frame dùng STT tạo fill. Không dùng `why` để quyết định semantic mode, chỉ dùng it cho log.
+- Đây là B với provenance rõ ràng, không tạo classifier.
+
+SAFEST DESIGN:
+OPTION D / B có provenance explicit. PLAN mode là owner của contain-vs-fill khi `seg.frames` hợp lệ; Speaker AI chỉ owner WHO/cx/cy và split timing bên trong PLAN fill. Scene/timer fallback giữ STT behavior hiện tại để không làm run thiếu framing bị toàn contain.
+
+PROPOSED PRECEDENCE:
+1. Explicit PLAN contain => contain, không bị `applySpeechToWindows` hay fill-under-28% đổi thành fill.
+2. Explicit PLAN fill => fill; dedicated speech/Google timing có thể split window và chọn who/cx/cy, nhưng không cần tạo fill ngoài PLAN fill.
+3. Không có framing hợp lệ => scene/timer fallback; giữ current STT-to-fill behavior và RGB safeguards.
+4. RGB vẫn chỉ refine cx/cy và chỉ có các safety demotion hiện tại; không thay đổi RGB algorithm.
+5. FFmpeg render mode cuối theo window sau các rule trên.
+
+FALLBACK MATRIX:
+A. PLAN explicit WIDE + speaker: contain giữ nguyên toàn overlap; speaker data không đổi nhưng không tạo crop fill.
+B. PLAN explicit CLOSE + speaker: fill giữ nguyên; speaker who/cx/cy và current split logic dùng cho target/timing.
+C. PLAN framing missing + speaker: scene/timer fallback, current STT-to-fill dùng như hiện tại.
+D. Speaker AI fail, plan._raw speech: mode vẫn theo explicit PLAN; fallback speech chỉ cung cấp target/timing trong PLAN fill. Nếu frames missing thì giữ fallback STT behavior.
+E. Google STT snap: chỉ dịch `t` của speech line; không đổi mode/provenance. Quy tắc A-D vẫn áp dụng.
+F. No speech: explicit PLAN mode giữ nguyên; fallback scene/timer mode giữ nguyên. Không có applySpeech/force-fill.
+G. PLAN track có who/cx nhưng framing absent: track không đặt mode; scene/timer fallback mode được dùng, speech nếu có mới tạo fill như hiện tại. Không nên suy ra mode từ track.
+
+NEW AI CALL REQUIRED:
+NO
+
+PLAN PROMPT/SCHEMA CHANGE REQUIRED:
+NO cho patch an toàn nhỏ nhất: mode hiện có đã diễn đạt WIDE/CONTAIN vs CLOSE/FILL. Cần parser/provenance trong code, không cần thay model/prompt.
+- Chỉ cân nhắc bổ sung schema sau A/B test nếu muốn phân biệt lý do context có cấu trúc hơn `why`; không cần cho fix confirmed override hiện tại.
+
+FUNCTIONS THAT WOULD CHANGE:
+- `mixFrameClip()` (ghostforge-server.js:2144): đánh dấu windows xuất phát từ PLAN hợp lệ vs scene/timer fallback và truyền policy.
+- `applySpeechToWindows()` (2098): không rewrite explicit PLAN contain; với explicit PLAN fill chỉ bổ sung/split speech trong phạm vi fill.
+- Force-fill block trong `mixFrameClip()` (2247): không chuyển protected PLAN contain sang fill.
+- Có thể cần một field nội bộ nhỏ trên window, ví dụ `planMode: true`; không đổi API/output schema.
+
+EXPECTED EFFECT ON ACCURACY:
+- Giữ được context mà PLAN đã chọn WIDE/CONTAIN, bao gồm case 40-42; ngăn dedicated speaker timing biến wide intentional thành speaker crop.
+- Giữ accuracy người nói/cx/cy cho những window PLAN đã chọn fill.
+- Rủi ro chính: PLAN contain sai sẽ không được speech tự động sửa. Fallback thiếu framing vẫn giữ behavior hiện tại để giảm rủi ro đó.
+
+EXPECTED API/QUOTA EFFECT:
+Không đổi: không thêm/bỏ API call, proxy, prompt, model hoặc retry.
+
+IMPLEMENTATION RISK:
+MEDIUM
+- Patch code nhỏ nhưng thay đổi precedence visual. Cần test video thực tế có WIDE intentional + speech, PLAN CLOSE + speech, và framing fallback để xác nhận không làm mất fill cần thiết.
+
+RECOMMENDED NEXT PATCH:
+Patch nhỏ nhất: trong `mixFrameClip()`, xác định `hasExplicitPlanFrames` trước scene fallback. Gắn provenance nội bộ cho các PLAN windows. Sửa `applySpeechToWindows()` để không tạo fill từ speech trong window `contain` có provenance PLAN; vẫn giữ/split speech trong PLAN fill. Sửa force-fill <28% để bỏ qua contain protected. Không thay prompt/model/API/RGB/FFmpeg. Validation sau implementation: node check + npm test; video A/B tối thiểu cho ba case trong phần Expected effect.

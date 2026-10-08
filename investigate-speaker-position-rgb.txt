@@ -1,0 +1,45 @@
+POSITION ROOT CAUSE:
+Dedicated STT asks for cx/cy per utterance and parseSpeechLines() preserves valid values (clamped). They are optional in parsing; source has no metric proving how often the model omits them. After the identity-preservation patch, applySpeechToWindows() creates speech-derived fill windows with who and only retains cx/cy when the dedicated line supplied them. splitFillOnSpeaker() preserves those values; when absent, it accepts PLAN-track position only if the PLAN name matches the dedicated speaker under the existing substring match.
+
+However, mixFrameClip() currently computes wantCx in this order: PLAN nowCx from cxForWhoAt(named, tLock, track), then lineCx from the speech-derived window, then seat fallback. Therefore a matching PLAN-track coordinate overrides an available dedicated-STT line coordinate. This is a confirmed position-precedence issue independent of the old who-loss bug.
+
+SOURCE OF CX WHEN SPEECH CX MISSING:
+1. cxForWhoAt(named, tLock, track): nearest matching PLAN-track point by name.
+2. seatCx(named, seats): global median seat built from all speech and PLAN-track positions for that name.
+3. hintCxAt(): nearest track point in the window +/- 0.25s, then hintCxForWindow() uses the window midpoint with +/- 0.4s filtering; if none, it defaults to 0.5.
+4. sampleTalkerX()/snapToPeak() may move the selected hint to a nearby RGB peak.
+
+CAN cxForWhoAt USE STALE POSITION:
+YES. It filters only by case-insensitive exact-or-substring speaker name, then selects nearest time across the entire track. It has no maximum temporal distance, scene boundary, or shot-change check. The seat map is also global: it is a median across all positions for a name and has no scene boundary.
+
+CAN RGB PICK WRONG OBJECT:
+YES. sampleTalkerX() has no speaker identity input. It reads two RGB frames at t and t+0.2, scores each x-column from variance/edges/motion, applies screen/prop gates and puppet-color boosts, then exposes peaks. It returns no confidence score. snapToPeak() may move a hint to the nearest peak within 0.28 normalized x. Background, a door, or an object can still be a selected peak if it survives these pixel heuristics.
+
+CAN RGB OVERRIDE CORRECT CX:
+YES. At the initial fill sample and each later sample, snapToPeak() can move the hint by up to 0.28. Later RGB updates replace cx whenever the new result differs from the current cx by more than 0.18. RGB changes cx only; it does not change who.
+
+FINAL CUT POINTS REALLY USED:
+YES. Each emitted CUT adds hold points at t-0.03 with the old cx and at t with the new cx. snapSpeakerTrack() preserves the points, and ffmpegHoldSnapExpr() converts them to the crop x/y expressions used in the final FFmpeg filter. The summary line "fill @0.60" is only the window's final w.cx value after refinement; it does not mean FFmpeg uses 0.60 for the entire window. Hold points whose cx difference exceeds 0.10 are rendered as holds rather than interpolation.
+
+RUN A cx=0.44 MOST LIKELY SOURCE:
+Cannot be proven from the supplied log alone. Source paths capable of producing 0.44 are: the nearest same-name PLAN track via cxForWhoAt; dedicated STT line cx only if PLAN nowCx was unavailable; global seat median; a local window track hint; or an RGB peak/hint value selected by snapToPeak. Given current precedence, a matching PLAN track is preferred over dedicated line cx. A stale same-name track or global seat can also explain a center-adjacent door target.
+
+RGB MAIN COST:
+Each sampleTalkerX() runs two sequential grabRgbFrame() calls. Each grab spawns a new FFmpeg process, seeks with -ss, decodes one frame, scales it to 96 pixels wide, and returns raw RGB. Calls are sequential: one initial sample for every fill window, one sample every 0.9s while a fill window lasts, plus one midpoint sample for each contain window considered by force-fill logic. There is no cache. The timing log is the accumulated wall time of these sample calls. Source has no logged sample count, so 11.74/11.95/19.74s cannot be converted to an exact count without the specific windows.
+
+Duplicate timestamps are not explicitly prevented: separate split/force-fill windows can request the same timestamp, and no result cache exists. A cache keyed exactly by input path, timestamp, grid width, and grid height could reuse identical RGB bytes/results without changing the analysis result. Batching/seeking differently is not proven pixel-identical because it can alter FFmpeg seek/decode behavior.
+
+SAFEST ACCURACY FIX:
+Change only the initial position precedence in mixFrameClip() to use an available speech-derived line cx before PLAN nowCx, then retain PLAN track, seat, and RGB as fallbacks. This directly matches the intended dedicated-position precedence and does not alter identity, APIs, crop expression, or RGB algorithm. A separate, carefully validated follow-up may add a temporal bound to cxForWhoAt using the existing local-window timing semantics; source has no scene-boundary data, so it should not be guessed in the same patch.
+
+FUNCTIONS INVOLVED:
+vertexJsonVideo() prompt/output path, parseSpeechLines(), applySpeechToWindows(), splitFillOnSpeaker(), cxForWhoAt(), buildSeatLock(), seatCx(), hintCxAt(), hintCxForWindow(), grabRgbFrame(), rgbColScore(), sampleTalkerX(), snapToPeak(), snapSpeakerTrack(), ffmpegHoldSnapExpr(), mixFrameClip().
+
+ACCURACY RISK CURRENT:
+HIGH. Dedicated speaker identity is now preserved, but an available dedicated position can still be overridden by unrestricted same-name PLAN tracking. When that hint is stale or wrong, identity-blind RGB can move it to a nearby non-speaker visual peak, and the resulting CUT points are applied to the actual FFmpeg crop.
+
+RECOMMENDED NEXT PATCH:
+Smallest patch: change wantCx precedence from [nowCx, lineCx, locked] to [lineCx, nowCx, locked] in mixFrameClip(). Validate with the 60-second Brooklyn case: dedicated cx remains primary, PLAN is used only when line cx is absent, and all RGB CUT hold points/render behavior remain unchanged.
+
+VALIDATION:
+Source inspection only. No source changes and no tests run.

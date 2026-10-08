@@ -1,0 +1,59 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -3112,7 +3112,7 @@ const planSpeakerIntervals = (plan) => {
+     return intervals.filter((x) => x.end > x.start);
+ };
+ 
+-const mapDiarizationToPlan = (turns, plan) => {
++const mapDiarizationToPlan = (turns, plan, onDiagnostic) => {
+     const intervals = planSpeakerIntervals(plan);
+     if (!intervals.length) return { ok: false, reason: 'PLAN speaker track unavailable' };
+     const ranges = (plan?.segments || []).flatMap((seg) => {
+@@ -3128,6 +3128,7 @@ const mapDiarizationToPlan = (turns, plan) => {
+         byCluster.get(turn.speakerId).push(turn);
+     }
+     const names = new Map();
++    let diagnosticCount = 0;
+     for (const [speakerId, clusterTurns] of byCluster) {
+         const total = clusterTurns.reduce((sum, turn) => sum + ranges.reduce((inside, range) => (
+             inside + Math.max(0, Math.min(turn.end, range.end) - Math.max(turn.start, range.start))
+@@ -3150,6 +3151,24 @@ const mapDiarizationToPlan = (turns, plan) => {
+             && evidence / Math.max(0.01, total) >= 0.45
+             && winner[1] / evidence >= 0.70
+             && winner[1] - second >= Math.max(0.35, evidence * 0.20);
++        if (diagnosticCount < 8 && typeof onDiagnostic === 'function') {
++            const coverage = evidence / Math.max(0.01, total);
++            const topShare = winner ? winner[1] / evidence : 0;
++            const margin = winner ? winner[1] - second : 0;
++            const requiredMargin = Math.max(0.35, evidence * 0.20);
++            const topName = String(winner?.[0] || 'none').replace(/\s+/g, ' ').trim();
++            const secondName = String(ranked[1]?.[0] || 'none').replace(/\s+/g, ' ').trim();
++            const ratio = (value) => Number(value).toFixed(2).replace(/^0/, '');
++            try {
++                onDiagnostic(
++                    `[EDIT] Local Listen map ${speakerId}: total=${total.toFixed(2)} evidence=${evidence.toFixed(2)} coverage=${ratio(coverage)} `
++                    + `${topName}=${(winner?.[1] || 0).toFixed(2)} ${secondName}=${second.toFixed(2)} `
++                    + `share=${ratio(topShare)} margin=${margin.toFixed(2)} needShare=.70 needMargin=${requiredMargin.toFixed(2)} `
++                    + `-> ${clear ? `mapped ${winner[0]}` : 'ambiguous'}`,
++                );
++            } catch { /* diagnostics must not affect mapping */ }
++            diagnosticCount += 1;
++        }
+         if (!clear) return { ok: false, reason: `ambiguous PLAN identity for ${speakerId}` };
+         names.set(speakerId, winner[0]);
+     }
+@@ -3468,7 +3487,11 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                 const localDiarStartedAt = Date.now();
+                 try {
+                     localTurns = await runLocalDiarization(job.inputPath, job);
+-                    localMapping = mapDiarizationToPlan(localTurns, plan);
++                    localMapping = mapDiarizationToPlan(
++                        localTurns,
++                        plan,
++                        (message) => send('log', { message }),
++                    );
+                     if (!localMapping.ok) throw new Error(localMapping.reason);
+                     const clusters = new Set(localTurns.map((x) => x.speakerId)).size;
+                     const characters = new Set(localMapping.names.values()).size;
+

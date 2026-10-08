@@ -1,0 +1,32 @@
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -123,6 +123,8 @@ FRAMING — required. 9:16 mix of WIDE vs CLOSE. Re-evaluate framing often, but l
+    DETAIL VISUAL SHOT SEGMENTATION: independently watch the video for every meaningful visual shot boundary: hard cut, camera-angle change, composition change, reaction shot, subject-layout change, insert/object shot, or focal-subject change.
+    Whenever such a meaningful visual boundary occurs, start a NEW frames[] window and independently classify that new shot as FILL or CONTAIN. The mode may remain the same across the boundary: same mode does NOT mean same shot, and same story/context does NOT mean same shot. Never merge visually distinct shots merely because their framing mode is unchanged.
+    DETAIL DIALOGUE SEGMENTATION: one frames[] window represents ONE visually continuous shot/composition, never an entire conversation, topic, or story beat. During dialogue, every new camera angle, visible speaker-focus change, reaction shot, composition/layout change, or cut to another puppet/person MUST start a new frames[] window even when the topic is unchanged, the mode remains the same, or everyone remains in the same room. Never use "back-and-forth argument", "conversation continues", or "group discussion" to justify one window spanning multiple visually distinct shots. For multi-shot dialogue, independently classify EACH shot as FILL or CONTAIN.
++   FRAMING-DECISION CONTINUITY: a Detail frames[] window represents ONE CONTINUOUS FRAMING DECISION, not merely one continuous camera shot, unchanged background, or unchanged room. Start a NEW frames[] window whenever the subject that should control framing materially changes: visual focus moves from one speaker to another, a listener/reaction becomes the visually dominant subject, focus returns from that reaction subject to another character, or the subject whose action/expression should control the crop changes. This applies to BOTH CONTAIN and FILL. The new window may independently choose the SAME mode as the previous window; for example, CONTAIN may remain CONTAIN across the boundary, but the new interval must still be independently classified and justified. Camera, background, room, or conversation-topic continuity does NOT justify one long Detail window after the framing target has materially changed.
++   Do NOT split for every small eye movement, mouth movement, gesture, pose change, or momentary gaze shift. Split only for a MATERIAL change in visual attention or in the subject controlling the framing decision. Segmentation happens before mode classification; focusLock is evaluated only later as optional post-FILL metadata and MUST NOT influence segmentation.
+    Candidate sceneCuts are supplementary trusted anchors for obvious cuts, not an exhaustive boundary list. Also identify meaningful visual/composition boundaries that are NOT listed in sceneCuts; visual segmentation must not depend solely on those hints.
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -96,6 +96,20 @@ test('detail dialogue uses one framing window per continuous visual shot', () =>
+   assert.doesNotMatch(guidance, /maximum CONTAIN duration|target FILL ratio/i);
+ });
+ 
++test('detail windows follow material framing-decision changes without over-segmentation', () => {
++  const guidance = detailSemanticFramingGuidance();
++  assert.match(guidance, /Detail frames\[\] window represents ONE CONTINUOUS FRAMING DECISION/i);
++  assert.match(guidance, /not merely one continuous camera shot, unchanged background, or unchanged room/i);
++  assert.match(guidance, /Start a NEW frames\[\] window whenever the subject that should control framing materially changes/i);
++  assert.match(guidance, /listener\/reaction becomes the visually dominant subject/i);
++  assert.match(guidance, /This applies to BOTH CONTAIN and FILL/i);
++  assert.match(guidance, /CONTAIN may remain CONTAIN across the boundary/i);
++  assert.match(guidance, /Camera, background, room, or conversation-topic continuity does NOT justify one long Detail window/i);
++  assert.match(guidance, /Do NOT split for every small eye movement, mouth movement, gesture, pose change, or momentary gaze shift/i);
++  assert.match(guidance, /Split only for a MATERIAL change in visual attention/i);
++  assert.match(guidance, /focusLock is evaluated only later as optional post-FILL metadata and MUST NOT influence segmentation/i);
++});
++
+ test('detail reaction focus guidance is narrow and requires focalCx', () => {

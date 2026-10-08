@@ -1,0 +1,94 @@
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -120,5 +120,9 @@ export const detailSemanticFramingGuidance = () => `
+ FRAMING — required. 9:16 mix of WIDE vs CLOSE. Re-evaluate framing often, but let scene semantics and visual-information preservation determine the mode.
+ 1) frames[] covers the WHOLE episode, no gaps. Same source timestamps as start/end.
++   DETAIL VISUAL SHOT SEGMENTATION: independently watch the video for every meaningful visual shot boundary: hard cut, camera-angle change, composition change, reaction shot, subject-layout change, insert/object shot, or focal-subject change.
++   Whenever such a meaningful visual boundary occurs, start a NEW frames[] window and independently classify that new shot as FILL or CONTAIN. The mode may remain the same across the boundary: same mode does NOT mean same shot, and same story/context does NOT mean same shot. Never merge visually distinct shots merely because their framing mode is unchanged.
++   Candidate sceneCuts are supplementary trusted anchors for obvious cuts, not an exhaustive boundary list. Also identify meaningful visual/composition boundaries that are NOT listed in sceneCuts; visual segmentation must not depend solely on those hints.
++   Boundaries must come from observed visual changes. Do not use fixed-duration slicing, arbitrary segmentation, forced alternation, a target window count, or a target FILL/CONTAIN percentage.
+    contain = WIDE (full 16:9 small in 9:16 + blur bars). Use CONTAIN for crowds, inserts, CCTV/laptop/poster/calendar views, prop-only shots, source shots already visually tight, or whenever cropping would lose relevant visual information.
+    fill = MEDIUM 1:1 crop (head + shoulders + chest). A speaker or two-shot alone determines neither FILL nor CONTAIN.
+    FILL: choose FILL when one subject is the clear focal point of the current shot AND a reasonable subject crop preserves all information necessary to understand the current beat.
+@@ -198,7 +202,6 @@ export const normalizeFrameMode = (raw) => {
+ 
+ export const stitchFrames = (windows, epDur, sceneCuts = null) => {
+     const dur = Math.max(0.2, Number(epDur) || 0);
+-    const detailCuts = Array.isArray(sceneCuts) ? compactSceneCutHints(sceneCuts, dur) : null;
+-    const semanticReason = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
++    const detailMode = Array.isArray(sceneCuts);
+     const list = (Array.isArray(windows) ? windows : [])
+         .filter((w) => w && (w.mode === 'fill' || w.mode === 'contain') && Number(w.b) - Number(w.a) >= 0.6)
+@@ -224,7 +227,6 @@ export const stitchFrames = (windows, epDur, sceneCuts = null) => {
+             out.push({ a: 0, b, mode: w.mode, why: w.why, cx: w.cx, cy: w.cy, cx2: w.cx2, cy2: w.cy2 });
+             continue;
+         }
+-        const transitionStart = last.b;
+         if (a > last.b + 0.12) last.b = round1(a);
+         const sameAim = last.mode === w.mode
+             && last.mode !== 'fill'
+@@ -232,9 +234,6 @@ export const stitchFrames = (windows, epDur, sceneCuts = null) => {
+             && Math.abs((last.cx ?? 0.5) - (w.cx ?? 0.5)) < 0.08
+             && Math.abs((last.cy ?? 0.42) - (w.cy ?? 0.42)) < 0.08;
+-        const sameReason = semanticReason(last.why) === semanticReason(w.why);
+-        const crossesSceneCut = detailCuts?.some((cut) => cut >= Math.min(transitionStart, a) - 0.2 && cut <= Math.max(transitionStart, a) + 0.2) || false;
+-        const preservesDetailBoundary = detailCuts !== null && (!sameReason || crossesSceneCut);
+-        if (sameAim && !preservesDetailBoundary) {
++        if (sameAim && !detailMode) {
+             last.b = round1(Math.max(last.b, b));
+             if (w.why && !last.why) last.why = w.why;
+             last.cx2 = w.cx2 ?? w.cx ?? last.cx2;
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -57,6 +57,15 @@ test('detail framing uses a semantic information-loss gate without fill quotas'
+   assert.match(guidance, /mere presence of another person, prop\/object, background context, movement, reaction, or spatial context is NOT enough/i);
+ });
+ 
++test('detail guidance requires Gemini to self-segment observed visual shots', () => {
++  const guidance = detailSemanticFramingGuidance();
++  assert.match(guidance, /independently watch the video for every meaningful visual shot boundary/i);
++  assert.match(guidance, /hard cut, camera-angle change, composition change, reaction shot, subject-layout change, insert\/object shot, or focal-subject change/i);
++  assert.match(guidance, /start a NEW frames\[\] window and independently classify that new shot/i);
++  assert.match(guidance, /same mode does NOT mean same shot/i);
++  assert.match(guidance, /Never merge visually distinct shots merely because their framing mode is unchanged/i);
++});
++
+ test('detail scene-cut hints remain non-mandatory re-evaluation points', () => {
+   const guidance = `${detailSemanticFramingGuidance()}${detailSceneCutGuidance([4.2], 10)}`;
+   assert.match(guidance, /Candidate visual shot boundaries.*4\.2/);
+@@ -64,6 +73,8 @@ test('detail scene-cut hints remain non-mandatory re-evaluation points', () => {
+   assert.match(guidance, /At EVERY candidate scene cut, make a fresh independent framing classification/i);
+   assert.match(guidance, /mode may remain the same across the cut only because the new shot independently satisfies the same decision/i);
+   assert.match(guidance, /not a mandatory FILL, CONTAIN, mode change, or split/i);
++  assert.match(guidance, /sceneCuts are supplementary trusted anchors.*not an exhaustive boundary list/i);
++  assert.match(guidance, /boundaries that are NOT listed in sceneCuts/i);
+ });
+ 
+ test('detail framing preserves different semantic contain reasons', () => {
+@@ -83,11 +94,21 @@ test('detail framing preserves a known scene-cut boundary', () => {
+   assert.equal(frames.length, 2);
+ });
+ 
+-test('detail framing may still merge genuinely identical adjacent windows', () => {
++test('detail framing preserves every valid raw Gemini shot boundary', () => {
+   const frames = stitchFrames([
+     { a: 0, b: 5, mode: 'contain', why: 'same context' },
+-    { a: 5, b: 10, mode: 'contain', why: 'same context' },
+-  ], 10, []);
++    { a: 5, b: 9, mode: 'contain', why: 'same context' },
++    { a: 9, b: 14, mode: 'contain', why: 'same context' },
++  ], 14, []);
++  assert.equal(frames.length, 3);
++  assert.deepEqual(frames.map((frame) => [frame.a, frame.b]), [[0, 5], [5, 9], [9, 14]]);
++});
++
++test('global framing keeps existing identical-contain merge behavior', () => {
++  const frames = stitchFrames([
++    { a: 0, b: 5, mode: 'contain', why: 'same context' },
++    { a: 5, b: 10, mode: 'contain', why: 'same context' },
++  ], 10, null);
+   assert.equal(frames.length, 1);
+   assert.equal(frames[0].b, 10);
+ });

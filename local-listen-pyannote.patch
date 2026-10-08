@@ -1,0 +1,284 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -666,6 +666,7 @@ app.get('/health', (_req, res) => {
+ });
+ 
+ const pgdPython = () => process.env.GHOSTFORGE_PYTHON || (fs.existsSync(path.join(__dirname, '.venv', 'Scripts', 'python.exe')) ? path.join(__dirname, '.venv', 'Scripts', 'python.exe') : 'python');
++const diarPython = () => process.env.GHOSTFORGE_DIAR_PYTHON || path.join(__dirname, '.venv-diar', 'Scripts', 'python.exe');
+ app.get('/api/pgd-status', async (_req, res) => {
+     const r = await runProcess(pgdPython(), ['-c', 'import numpy, torch, open_clip; print("CUDA_READY" if torch.cuda.is_available() else "CUDA_MISSING")'], { windowsHide: true, timeout: 30000 });
+     const ready = r.status === 0 && r.stdout.includes('CUDA_READY');
+@@ -3067,6 +3068,144 @@ const snapLinesToWords = (lines, words) => {
+     });
+ };
+ 
++const planSpeakerIntervals = (plan) => {
++    const intervals = [];
++    for (const seg of plan?.segments || []) {
++        const base = Number(seg.start) || 0;
++        const end = Number(seg.end) || base;
++        const pts = (Array.isArray(seg.track) ? seg.track : [])
++            .filter((p) => p && Number.isFinite(p.t) && String(p.who || '').trim())
++            .map((p) => ({ ...p, sourceT: base + p.t }))
++            .sort((a, b) => a.sourceT - b.sourceT);
++        for (let i = 0; i < pts.length; i++) {
++            const p = pts[i];
++            const left = i ? (pts[i - 1].sourceT + p.sourceT) / 2 : base;
++            const right = i + 1 < pts.length ? (p.sourceT + pts[i + 1].sourceT) / 2 : end;
++            intervals.push({
++                start: Math.max(base, left, p.sourceT - 1.5),
++                end: Math.min(end, right, p.sourceT + 1.5),
++                t: p.sourceT,
++                who: String(p.who).trim(),
++                cx: p.cx,
++                cy: p.cy,
++            });
++        }
++    }
++    return intervals.filter((x) => x.end > x.start);
++};
++
++const mapDiarizationToPlan = (turns, plan) => {
++    const intervals = planSpeakerIntervals(plan);
++    if (!intervals.length) return { ok: false, reason: 'PLAN speaker track unavailable' };
++    const ranges = (plan?.segments || []).flatMap((seg) => {
++        const pieces = Array.isArray(seg.pieces) && seg.pieces.length
++            ? seg.pieces
++            : [{ start: seg.start, end: seg.end }];
++        return pieces.map((p) => ({ start: Number(p.start), end: Number(p.end) }))
++            .filter((p) => Number.isFinite(p.start) && Number.isFinite(p.end) && p.end > p.start);
++    });
++    const byCluster = new Map();
++    for (const turn of turns) {
++        if (!byCluster.has(turn.speakerId)) byCluster.set(turn.speakerId, []);
++        byCluster.get(turn.speakerId).push(turn);
++    }
++    const names = new Map();
++    for (const [speakerId, clusterTurns] of byCluster) {
++        const total = clusterTurns.reduce((sum, turn) => sum + ranges.reduce((inside, range) => (
++            inside + Math.max(0, Math.min(turn.end, range.end) - Math.max(turn.start, range.start))
++        ), 0), 0);
++        if (total < 0.35) continue;
++        const scores = new Map();
++        for (const turn of clusterTurns) {
++            for (const hint of intervals) {
++                const overlap = Math.max(0, Math.min(turn.end, hint.end) - Math.max(turn.start, hint.start));
++                if (overlap <= 0) continue;
++                scores.set(hint.who, (scores.get(hint.who) || 0) + overlap);
++            }
++        }
++        const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1]);
++        const evidence = ranked.reduce((sum, x) => sum + x[1], 0);
++        const winner = ranked[0];
++        const second = ranked[1]?.[1] || 0;
++        const clear = winner
++            && evidence >= Math.max(0.8, total * 0.35)
++            && evidence / Math.max(0.01, total) >= 0.45
++            && winner[1] / evidence >= 0.70
++            && winner[1] - second >= Math.max(0.35, evidence * 0.20);
++        if (!clear) return { ok: false, reason: `ambiguous PLAN identity for ${speakerId}` };
++        names.set(speakerId, winner[0]);
++    }
++    if (!names.size) return { ok: false, reason: 'no diarization clusters overlap PLAN output' };
++    return { ok: true, names, intervals };
++};
++
++const mergeDiarizationWords = (turns, words, mapped) => turns.filter((turn) => mapped.names.has(turn.speakerId)).map((turn) => {
++    const who = mapped.names.get(turn.speakerId);
++    const mid = (turn.start + turn.end) / 2;
++    const text = words
++        .filter((w) => {
++            const wordMid = (w.t + w.end) / 2;
++            return wordMid >= turn.start - 0.12 && wordMid <= turn.end + 0.12;
++        })
++        .map((w) => w.word)
++        .join(' ')
++        .trim();
++    let position = null;
++    let distance = Infinity;
++    for (const hint of mapped.intervals) {
++        if (String(hint.who).toLowerCase() !== String(who).toLowerCase()) continue;
++        const d = Math.abs(hint.t - mid);
++        if (d < distance && d <= Math.max(1.5, (turn.end - turn.start) / 2 + 0.5)) {
++            distance = d;
++            position = hint;
++        }
++    }
++    return {
++        t: turn.start,
++        end: turn.end,
++        who,
++        text,
++        cx: Number.isFinite(position?.cx) ? position.cx : undefined,
++        cy: Number.isFinite(position?.cy) ? position.cy : undefined,
++    };
++});
++
++const runLocalDiarization = async (inputPath, job) => {
++    const wav = `${inputPath}.diar.wav`;
++    const helper = path.join(__dirname, 'local_listen_diarize.py');
++    try {
++        await runFf(['-y', '-i', inputPath, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wav], job);
++        if (!fs.existsSync(diarPython())) throw new Error(`Python not found: ${diarPython()}`);
++        if (!fs.existsSync(helper)) throw new Error('Local Listen helper missing');
++        const result = await new Promise((resolve, reject) => {
++            const child = spawn(diarPython(), [helper, wav], { windowsHide: true, env: process.env });
++            if (job) job.ffmpeg = child;
++            let stdout = '';
++            let stderr = '';
++            child.stdout.on('data', (d) => { stdout += d.toString(); });
++            child.stderr.on('data', (d) => { stderr += d.toString(); });
++            child.on('error', reject);
++            child.on('close', (code) => {
++                if (job) job.ffmpeg = null;
++                if (job?.cancelled) return reject(new Error('cancelled'));
++                if (code !== 0) return reject(new Error((stderr || `diarizer exit ${code}`).trim().slice(-500)));
++                resolve(stdout);
++            });
++        });
++        const parsed = JSON.parse(result);
++        if (!Array.isArray(parsed) || !parsed.length) throw new Error('diarization empty');
++        const turns = parsed.map((x) => ({
++            start: Number(x.start),
++            end: Number(x.end),
++            speakerId: String(x.speakerId || ''),
++        })).filter((x) => Number.isFinite(x.start) && Number.isFinite(x.end) && x.end > x.start && x.speakerId);
++        if (!turns.length) throw new Error('diarization JSON has no valid turns');
++        return turns;
++    } finally {
++        try { fs.unlinkSync(wav); } catch { /* ignore */ }
++    }
++};
++
+ const speechForSegment = (lines, seg, cutDur) => {
+     if (!Array.isArray(lines) || !lines.length) return [];
+     const pieces = Array.isArray(seg.pieces) && seg.pieces.length
+@@ -3302,6 +3441,61 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+         }
+ 
+         if (tiktokMix && mode === 'ai') {
++            if (process.env.GHOSTFORGE_VERTEX_LISTEN !== '1') {
++                send('log', { message: '[EDIT] Local Listen: pyannote diarization' });
++                send('progress', { value: 43, watch: 100, phase: 'stt' });
++                const fallbackSpeech = plan?._raw ? parseSpeechLines(plan._raw, duration) : [];
++                let localTurns = null;
++                let localMapping = null;
++                const localDiarStartedAt = Date.now();
++                try {
++                    localTurns = await runLocalDiarization(job.inputPath, job);
++                    localMapping = mapDiarizationToPlan(localTurns, plan);
++                    if (!localMapping.ok) throw new Error(localMapping.reason);
++                    const clusters = new Set(localTurns.map((x) => x.speakerId)).size;
++                    const characters = new Set(localMapping.names.values()).size;
++                    send('log', { message: `[EDIT] Local Listen: ${clusters} speaker clusters / ${characters} mapped characters` });
++                } catch (localErr) {
++                    const message = localErr instanceof Error ? localErr.message : String(localErr);
++                    if (/cancell/i.test(message) || job.cancelled) throw localErr;
++                    localTurns = null;
++                    localMapping = null;
++                    send('log', { message: `[EDIT] Local Listen fallback: ${message}`.slice(0, 240) });
++                } finally {
++                    logEditTiming('local speaker diarization', localDiarStartedAt);
++                }
++
++                speechAll = fallbackSpeech;
++                const googleSttStartedAt = Date.now();
++                try {
++                    const auth = await getAdcAuth();
++                    const words = await googleSttWords(
++                        auth, job.inputPath, duration, job,
++                        (m) => send('log', { message: m }),
++                    );
++                    if (localTurns && localMapping && words.length) {
++                        speechAll = mergeDiarizationWords(localTurns, words, localMapping);
++                    } else if (words.length && speechAll.length) {
++                        speechAll = snapLinesToWords(speechAll, words);
++                    } else if (localTurns && localMapping && !words.length) {
++                        send('log', { message: '[EDIT] Local Listen fallback: Google STT returned no words' });
++                    }
++                    if (words.length) {
++                        send('log', { message: `[EDIT] Google STT ${words.length} words${speechAll.length ? ` — snap ${speechAll.length} lines` : ''}` });
++                    }
++                } catch (sttErr) {
++                    const message = sttErr instanceof Error ? sttErr.message : String(sttErr);
++                    if (/cancell/i.test(message) || job.cancelled) throw sttErr;
++                    speechAll = fallbackSpeech;
++                    send('log', { message: `[EDIT] Google STT skip: ${message}`.slice(0, 220) });
++                } finally {
++                    logEditTiming('Google STT', googleSttStartedAt);
++                }
++                send('log', { message: `[EDIT] STT ${speechAll.length} spoken lines` });
++                speechAll.slice(0, 8).forEach((l) => {
++                    send('log', { message: `[EDIT]   ${l.t.toFixed(2)}–${l.end.toFixed(2)}s  ${l.who}  “${(l.text || '').slice(0, 48)}”` });
++                });
++            } else {
+             send('log', { message: testSec > 0
+                 ? '[EDIT] TEST STT: listen + Google STT trên đúng 1 phút đã cắt (không xem full)'
+                 : '[EDIT] STT: nghe từng câu + mốc phoneme (thêm 1 API, chậm hơn)…' });
+@@ -3387,6 +3581,7 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                     try { fs.unlinkSync(listenProxy.replace(/\.mp4$/i, `_s${i}.mp4`)); } catch { /* ignore */ }
+                 }
+             }
++            }
+         }
+ 
+         send('plan', { summary: plan.summary, segments: plan.segments, duration });
+diff --git a/local_listen_diarize.py b/local_listen_diarize.py
+new file mode 100644
+--- /dev/null
++++ b/local_listen_diarize.py
+@@ -0,0 +1,52 @@
++"""Local pyannote diarization helper. JSON only on stdout."""
++
++import json
++import os
++import sys
++import wave
++
++import numpy as np
++import torch
++from pyannote.audio import Pipeline
++
++
++MODEL_ID = "pyannote/speaker-diarization-community-1"
++
++
++def read_pcm_wav(filename):
++    with wave.open(filename, "rb") as wav:
++        channels = wav.getnchannels()
++        sample_width = wav.getsampwidth()
++        sample_rate = wav.getframerate()
++        frames = wav.readframes(wav.getnframes())
++    if channels != 1 or sample_width != 2 or sample_rate != 16000:
++        raise RuntimeError("expected mono 16kHz PCM s16le WAV")
++    samples = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
++    return torch.from_numpy(samples).unsqueeze(0), sample_rate
++
++
++def main():
++    if len(sys.argv) != 2:
++        raise RuntimeError("usage: local_listen_diarize.py <wav>")
++    if not torch.cuda.is_available():
++        raise RuntimeError("CUDA unavailable")
++    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
++    pipeline = Pipeline.from_pretrained(MODEL_ID, token=token)
++    pipeline.to(torch.device("cuda"))
++    waveform, sample_rate = read_pcm_wav(sys.argv[1])
++    output = pipeline({"waveform": waveform, "sample_rate": sample_rate})
++    annotation = getattr(output, "speaker_diarization", output)
++    turns = [
++        {"start": round(segment.start, 3), "end": round(segment.end, 3), "speakerId": str(speaker)}
++        for segment, _, speaker in annotation.itertracks(yield_label=True)
++        if segment.end > segment.start
++    ]
++    print(json.dumps(turns, separators=(",", ":")))
++
++
++if __name__ == "__main__":
++    try:
++        main()
++    except Exception as exc:
++        print(f"Local Listen error: {exc}", file=sys.stderr)
++        raise
+

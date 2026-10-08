@@ -1,0 +1,71 @@
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -1978,6 +1978,11 @@ const hintCxAt = (t, w, track) => {
+ 
+ const splitFillOnSpeaker = (windows, track) => {
+     if (!Array.isArray(track) || !track.length) return windows;
++    const sameSpeaker = (a, b) => {
++        const x = String(a || '').toLowerCase().trim();
++        const y = String(b || '').toLowerCase().trim();
++        return Boolean(x && y && (x === y || x.includes(y) || y.includes(x)));
++    };
+     const out = [];
+     for (const w of windows) {
+         if (w.mode !== 'fill') {
+@@ -1992,24 +1997,36 @@ const splitFillOnSpeaker = (windows, track) => {
+             continue;
+         }
+         let a0 = w.a;
+-        let who = String(inside[0].who || w.why || '');
+-        let cx = inside[0].cx;
+-        let cy = inside[0].cy;
++        const speechWho = String(w.who || '').trim();
++        let trackWho = String(inside[0].who || w.why || '');
++        let trackCx = inside[0].cx;
++        let trackCy = inside[0].cy;
++        const pushPiece = (a, b) => out.push({
++            a, b, mode: 'fill',
++            who: speechWho || trackWho || undefined,
++            why: speechWho || trackWho || w.why,
++            cx: Number.isFinite(w.cx)
++                ? w.cx
++                : (!speechWho || sameSpeaker(speechWho, trackWho) ? trackCx : undefined),
++            cy: Number.isFinite(w.cy)
++                ? w.cy
++                : (!speechWho || sameSpeaker(speechWho, trackWho) ? trackCy : undefined),
++        });
+         for (let i = 1; i < inside.length; i++) {
+             const p = inside[i];
+             const pWho = String(p.who || '');
+-            const jump = (who && pWho && who.toLowerCase() !== pWho.toLowerCase())
+-                || (Number.isFinite(cx) && Number.isFinite(p.cx) && Math.abs(p.cx - cx) > 0.13);
++            const jump = (trackWho && pWho && trackWho.toLowerCase() !== pWho.toLowerCase())
++                || (Number.isFinite(trackCx) && Number.isFinite(p.cx) && Math.abs(p.cx - trackCx) > 0.13);
+             if (jump && p.t - a0 >= 0.85 && w.b - p.t >= 0.85) {
+-                out.push({ a: a0, b: p.t, mode: 'fill', why: who || w.why, cx, cy });
++                pushPiece(a0, p.t);
+                 a0 = p.t;
+-                who = pWho || who;
+-                cx = p.cx;
+-                cy = p.cy;
++                trackWho = pWho || trackWho;
++                trackCx = p.cx;
++                trackCy = p.cy;
+             }
+         }
+-        if (w.b - a0 >= 0.8) out.push({ a: a0, b: w.b, mode: 'fill', why: who || w.why, cx, cy });
++        if (w.b - a0 >= 0.8) pushPiece(a0, w.b);
+     }
+     return out;
+ };
+@@ -2113,8 +2130,8 @@ const applySpeechToWindows = (windows, speech) => {
+             if (b - a >= 0.65) {
+                 out.push({
+                     a, b, mode: 'fill', why: f.who, who: f.who,
+-                    cx: Number.isFinite(f.cx) ? f.cx : w.cx,
+-                    cy: Number.isFinite(f.cy) ? f.cy : w.cy,
++                    cx: Number.isFinite(f.cx) ? f.cx : undefined,
++                    cy: Number.isFinite(f.cy) ? f.cy : undefined,
+                 });
+             }
+             cursor = Math.max(cursor, b);

@@ -1,0 +1,88 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -2325,6 +2325,11 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+     } else {
+         windows = windows.map((w) => ({ ...w, planMode: w.mode }));
+     }
++    const countWindowModes = (items) => ({
++        contain: items.filter((w) => w?.mode === 'contain').length,
++        fill: items.filter((w) => w?.mode === 'fill').length,
++    });
++    const initialModeCounts = countWindowModes(windows);
+     const track = Array.isArray(speakerTrack) ? speakerTrack.filter((p) => p && Number.isFinite(p.t) && Number.isFinite(p.cx)) : [];
+     const speech = Array.isArray(speechLines) ? speechLines.filter((l) => l && Number.isFinite(l.t) && l.who) : [];
+     const seats = buildSeatLock(speech, track);
+@@ -2340,7 +2345,9 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+         how = `${how}+STT`;
+         onLog?.(`[EDIT] STT ${speech.length} lines — fill theo vị trí TRONG CẢNH (không khóa ghế)`);
+     }
++    const postSttModeCounts = countWindowModes(windows);
+     windows = splitFillOnSpeaker(windows, track);
++    const postSplitModeCounts = countWindowModes(windows);
+     const box = { w: evenPx(Math.min(srcW, srcH)), h: evenPx(Math.min(srcW, srcH)) };
+     const pts = [];
+     let rgbRefineMs = 0;
+@@ -2430,13 +2437,20 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+         }
+         pts.push({ t: Math.max(w.a + 0.03, w.b), cx, cy, who: speakerWho });
+     }
++    let forceProtected = 0;
++    let forceEligible = 0;
++    let forceFilled = 0;
+     {
+         const fillSec = windows.filter((w) => w.mode === 'fill').reduce((s, w) => s + (w.b - w.a), 0);
+         if (speech.length && fillSec < dur * 0.28) {
+             onLog?.(`[EDIT] Fill only ${fillSec.toFixed(0)}s — force STT talk windows back to fill`);
+             for (const w of windows) {
+                 if (w.mode === 'fill') continue;
+-                if (w.planMode === 'contain') continue;
++                if (w.planMode === 'contain') {
++                    forceProtected += 1;
++                    continue;
++                }
++                forceEligible += 1;
+                 const hit = speech.some((l) => l.end > w.a + 0.3 && l.t < w.b - 0.3);
+                 if (!hit || w.b - w.a < 0.8) continue;
+                 try {
+@@ -2446,6 +2460,7 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+                 } catch { continue; }
+                 const line = speech.find((l) => l.end > w.a + 0.2 && l.t < w.b - 0.2);
+                 w.mode = 'fill';
++                forceFilled += 1;
+                 w.who = resolveSpeakerWho({ windowWho: line?.who });
+                 w.why = w.who || w.why;
+                 w.cx = Number.isFinite(line?.cx) ? line.cx : w.cx;
+@@ -2457,6 +2472,7 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+             }
+         }
+     }
++    onLog?.(`[EDIT] Mix framing stages: initial contain=${initialModeCounts.contain} fill=${initialModeCounts.fill} · post-STT contain=${postSttModeCounts.contain} fill=${postSttModeCounts.fill} · post-split contain=${postSplitModeCounts.contain} fill=${postSplitModeCounts.fill} · RGB-demoted=${demoted} · force protected=${forceProtected} eligible=${forceEligible} forced=${forceFilled}`);
+     if (rgbSampleCount) onLog?.(`[EDIT TIMING] RGB/frame refinement: ${(rgbRefineMs / 1000).toFixed(2)}s`);
+     onLog?.(`[EDIT] Mix rules: STT talk = FILL on speaker (two-shot punch-in)`);
+     const containWins = windows.filter((w) => w.mode === 'contain');
+@@ -3520,6 +3536,24 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                     if (!detailSeg?.frames?.length || !detailSeg?.track?.length) {
+                         throw new Error('detail PLAN missing framing or speaker track');
+                     }
++                    const rawDetailSegments = detailPlan?._raw?.segments || detailPlan?._raw?.clips || [];
++                    const rawDetailSeg = Array.isArray(rawDetailSegments) ? rawDetailSegments[0] : null;
++                    const rawDetailFrames = rawDetailSeg
++                        ? (rawDetailSeg.frames || rawDetailSeg.framing || rawDetailSeg.shots || rawDetailSeg.layout || [])
++                        : [];
++                    const rawModeCounts = { contain: 0, fill: 0, other: 0 };
++                    for (const frame of Array.isArray(rawDetailFrames) ? rawDetailFrames : []) {
++                        const rawMode = Array.isArray(frame)
++                            ? frame[2]
++                            : frame?.mode || frame?.kind || frame?.framing || frame?.type;
++                        const normalizedMode = normalizeFrameMode(rawMode);
++                        if (normalizedMode === 'contain') rawModeCounts.contain += 1;
++                        else if (normalizedMode === 'fill') rawModeCounts.fill += 1;
++                        else rawModeCounts.other += 1;
++                    }
++                    const parsedContain = detailSeg.frames.filter((frame) => frame?.mode === 'contain').length;
++                    const parsedFill = detailSeg.frames.filter((frame) => frame?.mode === 'fill').length;
++                    send('log', { message: `[EDIT] Detail PLAN ${ordinal} modes: raw contain=${rawModeCounts.contain} fill=${rawModeCounts.fill} other=${rawModeCounts.other} · parsed contain=${parsedContain} fill=${parsedFill}` });
+                     plan.segments[index] = mergeSegmentDetail(seg, detailSeg);
+                     detailEnriched += 1;
+                     send('log', { message: `[EDIT] Detail PLAN ${ordinal}: ${detailSeg.frames.length} framing windows · ${detailSeg.track.length} speaker pts` });

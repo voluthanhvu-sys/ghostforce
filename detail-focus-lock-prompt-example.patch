@@ -1,0 +1,33 @@
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -132,7 +132,9 @@ FRAMING — required. 9:16 mix of WIDE vs CLOSE. Re-evaluate framing often, but l
+    The mere presence of another person, prop/object, background context, movement, reaction, or spatial context is NOT enough by itself to require CONTAIN. Use CONTAIN only when losing it would materially hurt understanding of the action, joke, reaction, relationship, reveal, or visual beat.
+    TWO-SHOT: the two-shot alone determines neither mode. Use FILL when one person is clearly focal, the second person is not needed to understand the beat, and a reasonable crop preserves the meaning. Use CONTAIN when both expressions/actions are simultaneously necessary, their interaction is the beat/joke, important action spans both sides, or the crop would materially remove needed information.
+    REACTION: use FILL for an isolated reaction when the reacting subject is clearly focal. Use CONTAIN when the reaction and its cause/action must be visible together to understand the moment.
+-   OPTIONAL REACTION FOCUS LOCK (Detail only): use {"focusLock":true,"focalWho":"Jeffy","focalCx":0.72,"focalCy":0.40} sparingly, only for ONE visually continuous reaction/focal shot where a silent or non-speaking visible subject is intentionally the focal subject and switching to the active speaker would lose the reaction or emotional beat. focalCx is required for an actionable lock; focalWho should name the visible focal subject when identifiable, and focalCy is optional. Do NOT use focusLock for ordinary dialogue, normal shot/reverse-shot, two people merely visible together, every emotional line, a long conversation, or an entire scene/topic.
++   OPTIONAL REACTION FOCUS LOCK (Detail only): when a FILL shot is visually centered on a non-speaking reaction/focal subject, another person speaks during that SAME continuous shot, and switching the crop to the active speaker would lose the intended reaction, emotional beat, or visual beat, you MUST emit focusLock:true, focalWho:"<visual focal subject>", focalCx:<source-frame x of that subject>, and focalCy:<source-frame y when known>. focalCx is REQUIRED whenever focusLock=true; focalWho should name the visible focal subject when identifiable, and focalCy is optional.
++   Keep focusLock sparse. Do NOT use focusLock for ordinary dialogue, merely because a listener/reaction is visible, normal shot/reverse-shot, when the active speaker is already the visual focal subject, every emotional line, a long conversation, or an entire scene/topic. One lock applies only to ONE visually continuous shot/composition. If camera angle, layout, or focal subject changes, start a new frames[] window. For every ordinary FILL window, omit focusLock/focalWho/focalCx/focalCy and let normal active-speaker tracking continue.
++   Detail reaction-focus example only (the timestamp, name, and coordinates are illustrative, not required values): {"start":68.4,"end":72.1,"mode":"fill","why":"Jeffy's reaction remains the visual focus while Marvin speaks","focusLock":true,"focalWho":"Jeffy","focalCx":0.72,"focalCy":0.40}
+    DIALOGUE GUARD: in normal dialogue with 1–2 visible puppets, FILL the speaking/focal puppet when a useful medium crop exists; do not mark the whole interaction CONTAIN merely because another puppet is visible. With 3 visible puppets, generally FILL the active speaker when a useful medium crop exists; three puppets alone is NOT sufficient reason for CONTAIN.
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -98,9 +98,18 @@ test('detail dialogue uses one framing window per continuous visual shot', () =>
+ 
+ test('detail reaction focus guidance is narrow and requires focalCx', () => {
+   const guidance = detailSemanticFramingGuidance();
+-  assert.match(guidance, /focusLock.*sparingly.*ONE visually continuous reaction\/focal shot/is);
+-  assert.match(guidance, /focalCx is required for an actionable lock/i);
++  assert.match(guidance, /focusLock/);
++  assert.match(guidance, /focalWho/);
++  assert.match(guidance, /focalCx/);
++  assert.match(guidance, /"focusLock":true.*"focalWho":"Jeffy".*"focalCx":0\.72.*"focalCy":0\.40/i);
++  assert.match(guidance, /non-speaking reaction\/focal subject.*you MUST emit focusLock:true/is);
++  assert.match(guidance, /focalCx is REQUIRED whenever focusLock=true/i);
+   assert.match(guidance, /Do NOT use focusLock for ordinary dialogue/i);
++  assert.match(guidance, /One lock applies only to ONE visually continuous shot\/composition/i);
++  assert.match(guidance, /active speaker is already the visual focal subject/i);
++  assert.match(guidance, /ordinary FILL window, omit focusLock\/focalWho\/focalCx\/focalCy/i);
++  assert.match(guidance, /example only.*illustrative, not required values/i);
+ });

@@ -1,0 +1,130 @@
+diff --git "a/ghostforge-server.js" b/ghostforge-server.js
+index 4d5469f..13f26e1 100644
+--- "a/ghostforge-server.js"
++++ b/ghostforge-server.js
+@@ -2173,6 +2173,33 @@ const hintCxAt = (t, w, track) => {
+     return hintCxForWindow(w, track);
+ };
+ 
++const diagnosticTrackPointForWho = (who, t, track) => {
++    const name = String(who || '').toLowerCase().trim();
++    if (!name || !Array.isArray(track) || !track.length) return null;
++    const matching = track.filter((p) => {
++        if (!isSpeakerIdentity(p.who)) return false;
++        const candidate = String(p.who || '').toLowerCase();
++        return candidate && (candidate === name || candidate.includes(name) || name.includes(candidate));
++    });
++    if (!matching.length) return null;
++    return matching.reduce((best, point) => (
++        Math.abs((Number(point.t) || 0) - t) < Math.abs((Number(best.t) || 0) - t) ? point : best
++    ));
++};
++
++const diagnosticNearestTrackHint = (t, w, track) => {
++    if (!Array.isArray(track) || !track.length) return null;
++    const nearTime = track
++        .filter((p) => p.t >= w.a - 0.25 && p.t <= w.b + 0.25)
++        .sort((a, b) => Math.abs(a.t - t) - Math.abs(b.t - t));
++    if (nearTime.length) return nearTime[0];
++    const mid = (w.a + w.b) / 2;
++    const nearWindow = track
++        .filter((p) => p.t >= w.a - 0.4 && p.t <= w.b + 0.4)
++        .sort((a, b) => Math.abs(a.t - mid) - Math.abs(b.t - mid));
++    return nearWindow[0] || track[0] || null;
++};
++
+ const splitFillOnSpeaker = (windows, track) => {
+     if (!Array.isArray(track) || !track.length) return windows;
+     const sameSpeaker = (a, b) => {
+@@ -2209,6 +2236,11 @@ const splitFillOnSpeaker = (windows, track) => {
+             cy: Number.isFinite(w.cy)
+                 ? w.cy
+                 : (!speechWho || sameSpeaker(speechWho, trackWho) ? trackCy : undefined),
++            _targetCxSource: Number.isFinite(w.cx)
++                ? w._targetCxSource
++                : ((!speechWho || sameSpeaker(speechWho, trackWho)) && Number.isFinite(trackCx) ? 'track-who' : undefined),
++            _speechWho: w._speechWho,
++            _speechCx: w._speechCx,
+         });
+         for (let i = 1; i < inside.length; i++) {
+             const p = inside[i];
+@@ -2338,6 +2370,9 @@ const applySpeechToWindows = (windows, speech, allowPlanContainOverride = false)
+                     planMode: w.planMode,
+                     cx: Number.isFinite(f.cx) ? f.cx : undefined,
+                     cy: Number.isFinite(f.cy) ? f.cy : undefined,
++                    _targetCxSource: Number.isFinite(f.cx) ? 'speech' : undefined,
++                    _speechWho: f.who,
++                    _speechCx: Number.isFinite(f.cx) ? f.cx : undefined,
+                 });
+             }
+             cursor = Math.max(cursor, b);
+@@ -2361,7 +2396,11 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+         windows = buildMixWindows(scenes, dur);
+         how = windows.length < 3 ? 'timer fallback' : 'scene fallback';
+     } else {
+-        windows = windows.map((w) => ({ ...w, planMode: w.mode }));
++        windows = windows.map((w) => ({
++            ...w,
++            planMode: w.mode,
++            _targetCxSource: Number.isFinite(w.cx) ? 'detail' : undefined,
++        }));
+     }
+     const countWindowModes = (items) => ({
+         contain: items.filter((w) => w?.mode === 'contain').length,
+@@ -2416,12 +2455,24 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+         if (job?.cancelled) throw new Error('cancelled');
+         const tLock = Math.max(0.04, w.a + 0.04);
+         const speakerWho = resolveSpeakerWho({ windowWho: w.who }) || '';
+-        const displayLabel = speakerWho || w.why || '';
+         const nowCx = cxForWhoAt(speakerWho, tLock, track, NaN);
+         const lineCx = Number.isFinite(w.cx) ? w.cx : NaN;
+         const locked = seatCx(speakerWho, seats, NaN);
+         const wantCx = [lineCx, nowCx, locked].find((v) => Number.isFinite(v));
+         const hint = Number.isFinite(wantCx) ? wantCx : hintCxAt(tLock, w, track);
++        const whoTrackPoint = diagnosticTrackPointForWho(speakerWho, tLock, track);
++        const nearestTrackPoint = diagnosticNearestTrackHint(tLock, w, track);
++        const baseCxSource = Number.isFinite(lineCx)
++            ? (w._targetCxSource || 'unknown')
++            : Number.isFinite(nowCx)
++                ? 'track-who'
++                : Number.isFinite(locked)
++                    ? 'seat'
++                    : nearestTrackPoint && Number.isFinite(nearestTrackPoint.cx)
++                        ? 'track-nearest'
++                        : 'default';
++        const diagnosticTrackPoint = whoTrackPoint || nearestTrackPoint;
++        const seatConsulted = !Number.isFinite(lineCx) && !Number.isFinite(nowCx);
+         const cy = Number.isFinite(w.cy) ? w.cy : 0.40;
+         let cx = hint;
+         let sampled0 = { closeup: false, empty: false, crowded: false, peaks: [], puppetRatio: 1, faceH: 0, twoShot: false };
+@@ -2429,6 +2480,7 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+             sampled0 = await sampleTalkerTimed(tLock);
+             cx = snapToPeak(hint, sampled0.peaks);
+         } catch { /* keep hint */ }
++        const rgbCx = cx;
+         const trueEmpty = sampled0.empty && sampled0.puppetRatio < 0.03;
+         if (trueEmpty) {
+             w.mode = 'contain';
+@@ -2459,7 +2511,7 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+         w.cy = cy;
+         const origB = w.b;
+         const side = cx < 0.5 ? 'LEFT' : 'RIGHT';
+-        onLog?.(`[EDIT]   FILL ${Number(w.a).toFixed(1)}–${Number(w.b).toFixed(1)}s  ${displayLabel || 'talk'}  ${side} cx ${cx.toFixed(2)}${sampled0.twoShot ? ' two-shot' : ''}`);
++        onLog?.(`[EDIT]   FILL ${Number(w.a).toFixed(1)}–${Number(w.b).toFixed(1)}s  who=${JSON.stringify(speakerWho)} why=${JSON.stringify(rawWhy)}  ${side} cx ${cx.toFixed(2)}${sampled0.twoShot ? ' two-shot' : ''}`);
+         pts.push({ t: Math.max(0, w.a), cx, cy, who: speakerWho });
+         for (let t = w.a + 0.9; t < origB - 0.55; t += 0.9) {
+             try {
+@@ -2483,6 +2535,13 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+             } catch { /* keep */ }
+         }
+         pts.push({ t: Math.max(w.a + 0.03, w.b), cx, cy, who: speakerWho });
++        const trackDiagnostic = diagnosticTrackPoint
++            ? ` track=${JSON.stringify(String(diagnosticTrackPoint.who || ''))}@${Number(diagnosticTrackPoint.t).toFixed(2)} cx=${Number(diagnosticTrackPoint.cx).toFixed(2)}`
++            : '';
++        const speechDiagnostic = w._speechWho || Number.isFinite(w._speechCx)
++            ? ` speechWho=${JSON.stringify(String(w._speechWho || ''))} speechCx=${Number.isFinite(w._speechCx) ? Number(w._speechCx).toFixed(2) : 'none'}`
++            : '';
++        onLog?.(`[EDIT] Fill target ${Number(w.a).toFixed(1)}-${Number(w.b).toFixed(1)}: planMode=${w.planMode || 'none'} who=${JSON.stringify(rawWho)} why=${JSON.stringify(rawWhy)} windowCx=${Number.isFinite(lineCx) ? lineCx.toFixed(2) : 'none'}${speechDiagnostic}${trackDiagnostic} seatCx=${Number.isFinite(locked) ? locked.toFixed(2) : 'none'} seatConsulted=${seatConsulted ? 'yes' : 'no'} baseCx=${Number(hint).toFixed(2)} source=${baseCxSource} rgb=${Number(hint).toFixed(2)}->${Number(rgbCx).toFixed(2)} moved=${Math.abs(rgbCx - hint) > 0.001 ? 'yes' : 'no'} finalCx=${Number(w.cx).toFixed(2)}`);
+     }
+     let forceProtected = 0;
+     let forceEligible = 0;

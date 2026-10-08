@@ -1,0 +1,57 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -4644,6 +4644,7 @@ export {
+     geminiDeleteFile,
+     getAdcAuth,
+     vertexGeneratePlan,
++    mixFrameClip,
+ };
+ 
+ if (process.env.GHOSTFORGE_STANDALONE === '1') {
+diff --git a/scripts/test-detail-plan-part5.js b/scripts/test-detail-plan-part5.js
+--- a/scripts/test-detail-plan-part5.js
++++ b/scripts/test-detail-plan-part5.js
+@@ -11,6 +11,7 @@ import {
+   geminiDeleteFile,
+   getAdcAuth,
+   vertexGeneratePlan,
++  mixFrameClip,
+ } from '../ghostforge-server.js';
+ import { compactSceneCutHints } from '../server/editor-plan.js';
+ 
+@@ -23,6 +24,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+ const tmpDir = path.join(root, 'tmp');
+ const runTag = `${Date.now()}-${process.pid}`;
+ const proxyPath = path.join(tmpDir, `detail-plan-part5-${runTag}.mp4`);
++const outputPath = path.join(tmpDir, 'detail-plan-part5-render.mp4');
+ const job = {
+   cancelled: false,
+   ffmpeg: null,
+@@ -124,6 +126,17 @@ const main = async () => {
+         .sort((a, b) => a - b)
+       : [];
+     const criticalBoundaries = boundaries.filter((value) => value > 30.5 && value < 79.3);
++    const renderStartedAt = performance.now();
++    await mixFrameClip(
++      INPUT,
++      outputPath,
++      job,
++      (message) => console.log(message),
++      normalized,
++      detailPlan?.segments?.[0]?.track || [],
++      [],
++    );
++    const renderRuntimeMs = performance.now() - renderStartedAt;
+ 
+     console.log('\nDETAIL PLAN PART 5');
+     console.log(`transport: ${API_KEY ? 'Gemini API upload' : 'Vertex ADC'}`);
+@@ -157,6 +170,8 @@ const main = async () => {
+     console.log(`longest window: ${longest ? `${fmt(longest.a)}-${fmt(longest.b)} ${longest.mode} (${durations[longestIndex].toFixed(2)}s)` : '(none)'}`);
+     console.log(`boundaries inside 30.5-79.3: ${criticalBoundaries.length} (${criticalBoundaries.map(fmt).join(', ') || 'none'})`);
+     console.log(`BOUNDARIES: ${boundaries.map(fmt).join(', ') || '(none)'}`);
++    console.log(`render runtime: ${(renderRuntimeMs / 1000).toFixed(2)}s`);
++    console.log(`final output: ${outputPath}`);
+   } finally {
+     if (uploaded) await geminiDeleteFile(API_KEY, uploaded.name);
+     cleanupProxyArtifacts();

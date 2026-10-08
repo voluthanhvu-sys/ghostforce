@@ -1,0 +1,11 @@
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -2191,7 +2191,7 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack, speechLines) => {
+         const nowCx = cxForWhoAt(named, tLock, track, NaN);
+         const lineCx = Number.isFinite(w.cx) ? w.cx : NaN;
+         const locked = seatCx(named, seats, NaN);
+-        const wantCx = [nowCx, lineCx, locked].find((v) => Number.isFinite(v));
++        const wantCx = [lineCx, nowCx, locked].find((v) => Number.isFinite(v));
+         const hint = Number.isFinite(wantCx) ? wantCx : hintCxAt(tLock, w, track);
+         const cy = Number.isFinite(w.cy) ? w.cy : 0.40;
+         let cx = hint;

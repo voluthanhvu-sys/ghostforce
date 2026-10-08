@@ -1,0 +1,94 @@
+diff --git "a/ghostforge-server.js" b/ghostforge-server.js
+index 6f0284e..17a01ec 100644
+--- "a/ghostforge-server.js"
++++ b/ghostforge-server.js
+@@ -2597,7 +2597,7 @@ async function geminiUploadVideo(apiKey, filePath, displayName) {
+     throw new Error('Gemini still processing the video — try a shorter clip');
+ }
+ 
+-async function geminiGeneratePlan(apiKey, model, fileUri, userPrompt, duration, maxParts, minSec, autoParts = false, tiktokMix = false, testClip = false, sceneCuts = null) {
++async function geminiGeneratePlan(apiKey, model, fileUri, userPrompt, duration, maxParts, minSec, autoParts = false, tiktokMix = false, testClip = false, sceneCuts = null, temperature = 0.2) {
+     const modelId = String(model || 'gemini-3.8-flash').replace(/[^a-zA-Z0-9._-]/g, '') || 'gemini-3.8-flash';
+     const sys = editorSysPrompt(userPrompt, duration, maxParts, minSec, autoParts, tiktokMix, testClip, sceneCuts);
+ 
+@@ -2613,7 +2613,7 @@ async function geminiGeneratePlan(apiKey, model, fileUri, userPrompt, duration,
+                     { text: sys },
+                 ],
+             }],
+-            generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
++            generationConfig: { responseMimeType: 'application/json', temperature },
+         }),
+     });
+     const j = await res.json().catch(() => ({}));
+@@ -2769,7 +2769,7 @@ async function shrinkProxyForVertex(srcPath, job, onLog) {
+     return { filePath: current, extras, mb: fs.statSync(current).size / 1024 / 1024 };
+ }
+ 
+-async function vertexGeneratePlan(auth, model, videoPath, userPrompt, duration, maxParts, minSec, job, onLog, autoParts = false, tiktokMix = false, testClip = false, timingLabel = 'plan AI', sceneCuts = null) {
++async function vertexGeneratePlan(auth, model, videoPath, userPrompt, duration, maxParts, minSec, job, onLog, autoParts = false, tiktokMix = false, testClip = false, timingLabel = 'plan AI', sceneCuts = null, temperature = 0.2) {
+     const shrunk = await shrinkProxyForVertex(videoPath, job, onLog);
+     const filePath = shrunk.filePath;
+     if (onLog) onLog(`[EDIT] Vertex proxy ${shrunk.mb.toFixed(1)}MB`);
+@@ -2784,7 +2784,7 @@ async function vertexGeneratePlan(auth, model, videoPath, userPrompt, duration,
+                 { text: editorSysPrompt(userPrompt, duration, maxParts, minSec, autoParts, tiktokMix, testClip, sceneCuts) },
+             ],
+         }],
+-        generationConfig: { temperature: 0.2, responseMimeType: 'application/json' },
++        generationConfig: { temperature, responseMimeType: 'application/json' },
+     });
+     let lastErr = '';
+     const aiStartedAt = Date.now();
+@@ -3511,7 +3511,7 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                     );
+                     send('log', { message: `[EDIT] Detail PLAN ${ordinal}: ${pieceCount} piece${pieceCount === 1 ? '' : 's'} · local ${detailDuration.toFixed(1)}s` });
+                     send('log', { message: `[EDIT] Detail PLAN ${ordinal}: ${detailSceneCuts.length} candidate scene cuts` });
+-                    send('log', { message: `[EDIT] Detail settings ${ordinal}: model=${model} promptHash=${shortPromptHash(userPrompt)} sceneCuts=${detailSceneCuts.length}` });
++                    send('log', { message: `[EDIT] Detail settings ${ordinal}: model=${model} promptHash=${shortPromptHash(userPrompt)} sceneCuts=${detailSceneCuts.length} temperature=0` });
+ 
+                     const detailProxyStartedAt = Date.now();
+                     try {
+@@ -3538,7 +3538,7 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                                 detailPlan = await geminiGeneratePlan(
+                                     apiKey, model, uploaded.uri, userPrompt,
+                                     detailDuration, 1, detailMinSec, false, true, true,
+-                                    detailSceneCuts,
++                                    detailSceneCuts, 0,
+                                 );
+                             } finally {
+                                 logEditTiming(`detail AI ${ordinal}`, detailAiStartedAt);
+@@ -3552,7 +3552,7 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                             auth, model, detailProxy, userPrompt,
+                             detailDuration, 1, detailMinSec, job,
+                             (m) => send('log', { message: m }),
+-                            false, true, true, `detail AI ${ordinal}`, detailSceneCuts,
++                            false, true, true, `detail AI ${ordinal}`, detailSceneCuts, 0,
+                         );
+                     }
+                     const detailSeg = detailPlan?.segments?.[0];
+@@ -4033,7 +4033,7 @@ app.get('/api/edit/part-test/stream/:jobId', async (req, res) => {
+         const excerptProbe = await probeMedia(excerptPath);
+         const duration = Number(excerptProbe.durationSec) || ranges.reduce((sum, [a, b]) => sum + b - a, 0);
+         const sceneCuts = compactSceneCutHints(await detectSceneTimes(excerptPath, duration, job), duration);
+-        send('log', { message: `[EDIT] TARGETED Detail settings Part ${partIndex}: model=${model} promptHash=${shortPromptHash(userPrompt)} sceneCuts=${sceneCuts.length}` });
++        send('log', { message: `[EDIT] TARGETED Detail settings Part ${partIndex}: model=${model} promptHash=${shortPromptHash(userPrompt)} sceneCuts=${sceneCuts.length} temperature=0` });
+ 
+         const proxyStartedAt = Date.now();
+         await runEditEncode([
+@@ -4049,7 +4049,7 @@ app.get('/api/edit/part-test/stream/:jobId', async (req, res) => {
+             const uploaded = await geminiUploadVideo(apiKey, proxyPath, `target-part-${partIndex}`);
+             try {
+                 const startedAt = Date.now();
+-                plan = await geminiGeneratePlan(apiKey, model, uploaded.uri, userPrompt, duration, 1, detailMinSec, false, true, true, sceneCuts);
++                plan = await geminiGeneratePlan(apiKey, model, uploaded.uri, userPrompt, duration, 1, detailMinSec, false, true, true, sceneCuts, 0);
+                 logTiming(`detail AI Part ${partIndex}`, startedAt);
+             } finally {
+                 await geminiDeleteFile(apiKey, uploaded.name);
+@@ -4059,7 +4059,7 @@ app.get('/api/edit/part-test/stream/:jobId', async (req, res) => {
+             plan = await vertexGeneratePlan(
+                 auth, model, proxyPath, userPrompt, duration, 1, detailMinSec, job,
+                 (message) => send('log', { message }), false, true, true,
+-                `detail AI Part ${partIndex}`, sceneCuts,
++                `detail AI Part ${partIndex}`, sceneCuts, 0,
+             );
+         }
+         const detailSeg = plan?.segments?.[0];

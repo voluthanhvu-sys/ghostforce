@@ -1,0 +1,156 @@
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -132,6 +132,7 @@ FRAMING — required. 9:16 mix of WIDE vs CLOSE. Re-evaluate framing often, but l
+    The mere presence of another person, prop/object, background context, movement, reaction, or spatial context is NOT enough by itself to require CONTAIN. Use CONTAIN only when losing it would materially hurt understanding of the action, joke, reaction, relationship, reveal, or visual beat.
+    TWO-SHOT: the two-shot alone determines neither mode. Use FILL when one person is clearly focal, the second person is not needed to understand the beat, and a reasonable crop preserves the meaning. Use CONTAIN when both expressions/actions are simultaneously necessary, their interaction is the beat/joke, important action spans both sides, or the crop would materially remove needed information.
+    REACTION: use FILL for an isolated reaction when the reacting subject is clearly focal. Use CONTAIN when the reaction and its cause/action must be visible together to understand the moment.
++   OPTIONAL REACTION FOCUS LOCK (Detail only): use {"focusLock":true,"focalWho":"Jeffy","focalCx":0.72,"focalCy":0.40} sparingly, only for ONE visually continuous reaction/focal shot where a silent or non-speaking visible subject is intentionally the focal subject and switching to the active speaker would lose the reaction or emotional beat. focalCx is required for an actionable lock; focalWho should name the visible focal subject when identifiable, and focalCy is optional. Do NOT use focusLock for ordinary dialogue, normal shot/reverse-shot, two people merely visible together, every emotional line, a long conversation, or an entire scene/topic.
+    DIALOGUE GUARD: in normal dialogue with 1–2 visible puppets, FILL the speaking/focal puppet when a useful medium crop exists; do not mark the whole interaction CONTAIN merely because another puppet is visible. With 3 visible puppets, generally FILL the active speaker when a useful medium crop exists; three puppets alone is NOT sufficient reason for CONTAIN.
+@@ -220,6 +221,10 @@ export const stitchFrames = (windows, epDur, sceneCuts = null) => {
+             cy: w.cy,
+             cx2: w.cx2,
+             cy2: w.cy2,
++            focusLock: w.focusLock === true,
++            focalWho: w.focalWho,
++            focalCx: w.focalCx,
++            focalCy: w.focalCy,
+         }))
+@@ -234,7 +239,7 @@ export const stitchFrames = (windows, epDur, sceneCuts = null) => {
+         if (b - a < 0.7) continue;
+         if (!last) {
+-            out.push({ a: 0, b, mode: w.mode, why: w.why, cx: w.cx, cy: w.cy, cx2: w.cx2, cy2: w.cy2 });
++            out.push({ a: 0, b, mode: w.mode, why: w.why, cx: w.cx, cy: w.cy, cx2: w.cx2, cy2: w.cy2, focusLock: w.focusLock, focalWho: w.focalWho, focalCx: w.focalCx, focalCy: w.focalCy });
+             continue;
+@@ -254,6 +259,10 @@ export const stitchFrames = (windows, epDur, sceneCuts = null) => {
+                 cx2: w.cx2,
+                 cy2: w.cy2,
++                focusLock: w.focusLock,
++                focalWho: w.focalWho,
++                focalCx: w.focalCx,
++                focalCy: w.focalCy,
+             });
+@@ -278,7 +287,7 @@ export const parseFraming = (s, epStart, epEnd, sceneCuts = null) => {
+-        let a, b, mode, why = '', cx, cy, cx2, cy2;
++        let a, b, mode, why = '', cx, cy, cx2, cy2, focusLock = false, focalWho, focalCx, focalCy;
+@@ -290,6 +299,11 @@ export const parseFraming = (s, epStart, epEnd, sceneCuts = null) => {
+             cx2 = clamp01(f.cx2 ?? f.x2, Number.isFinite(cx) ? cx : NaN);
+             cy2 = clamp01(f.cy2 ?? f.y2, Number.isFinite(cy) ? cy : NaN);
++            focusLock = f.focusLock === true;
++            const rawFocalWho = String(f.focalWho || '').trim().slice(0, 48);
++            focalWho = isSpeakerIdentity(rawFocalWho) ? rawFocalWho : undefined;
++            focalCx = clamp01(f.focalCx, NaN);
++            focalCy = clamp01(f.focalCy, NaN);
+@@ -304,6 +318,10 @@ export const parseFraming = (s, epStart, epEnd, sceneCuts = null) => {
+             cx2: Number.isFinite(cx2) ? cx2 : undefined,
+             cy2: Number.isFinite(cy2) ? cy2 : undefined,
++            focusLock,
++            focalWho,
++            focalCx: Number.isFinite(focalCx) ? focalCx : undefined,
++            focalCy: Number.isFinite(focalCy) ? focalCy : undefined,
+         });
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -2213,6 +2213,10 @@ const splitFillOnSpeaker = (windows, track) => {
+             continue;
+         }
++        if (w.focusLock === true && Number.isFinite(w.focalCx)) {
++            out.push(w);
++            continue;
++        }
+         const inside = track
+@@ -2347,6 +2351,10 @@ const applySpeechToWindows = (windows, speech, allowPlanContainOverride = false)
+     const out = [];
+     for (const w of windows) {
++        if (w.mode === 'fill' && w.focusLock === true && Number.isFinite(w.focalCx)) {
++            out.push(w);
++            continue;
++        }
+         if (w.planMode === 'contain' && !allowPlanContainOverride) {
+@@ -2402,7 +2410,11 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+             ...w,
+             planMode: w.mode,
+-            _targetCxSource: Number.isFinite(w.cx) ? 'detail' : undefined,
++            cx: w.focusLock === true && Number.isFinite(w.focalCx) ? w.focalCx : w.cx,
++            cy: w.focusLock === true && Number.isFinite(w.focalCx) && Number.isFinite(w.focalCy) ? w.focalCy : w.cy,
++            _targetCxSource: w.focusLock === true && Number.isFinite(w.focalCx)
++                ? 'focal'
++                : (Number.isFinite(w.cx) ? 'detail' : undefined),
+         }));
+@@ -5072,6 +5084,8 @@ export {
+     mixFrameClip,
+     hintCxForWindow,
++    applySpeechToWindows,
++    splitFillOnSpeaker,
+ };
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan, sourceTimeForTrackPoint, shouldUsePerPartDetailPlan, mergeSegmentDetail, compactSceneCutHints, detailSceneCutGuidance, detailSemanticFramingGuidance, stitchFrames, isSpeakerIdentity, resolveSpeakerWho, parseSpeechLines } from '../server/editor-plan.js';
++import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan, sourceTimeForTrackPoint, shouldUsePerPartDetailPlan, mergeSegmentDetail, compactSceneCutHints, detailSceneCutGuidance, detailSemanticFramingGuidance, stitchFrames, isSpeakerIdentity, resolveSpeakerWho, parseSpeechLines, parseFraming } from '../server/editor-plan.js';
+@@ -96,6 +96,30 @@ test('detail dialogue uses one framing window per continuous visual shot', () =>
+ });
++test('detail reaction focus guidance is narrow and requires focalCx', () => {
++  const guidance = detailSemanticFramingGuidance();
++  assert.match(guidance, /focusLock.*sparingly.*ONE visually continuous reaction\/focal shot/is);
++  assert.match(guidance, /focalCx is required for an actionable lock/i);
++  assert.match(guidance, /Do NOT use focusLock for ordinary dialogue/i);
++});
++
++test('detail parser and stitch preserve optional reaction focus fields', () => {
++  const frames = parseFraming({ frames: [{
++    start: 0,
++    end: 4,
++    mode: 'fill',
++    why: 'Jeffy reaction remains visually important',
++    focusLock: true,
++    focalWho: 'Jeffy',
++    focalCx: 0.72,
++    focalCy: 0.41,
++  }] }, 0, 4, []);
++  assert.equal(frames.length, 1);
++  assert.equal(frames[0].focusLock, true);
++  assert.equal(frames[0].focalWho, 'Jeffy');
++  assert.equal(frames[0].focalCx, 0.72);
++  assert.equal(frames[0].focalCy, 0.41);
++});
+diff --git a/tests/detail-focus-lock.test.js b/tests/detail-focus-lock.test.js
+new file mode 100644
+--- /dev/null
++++ b/tests/detail-focus-lock.test.js
+@@ -0,0 +1,37 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { applySpeechToWindows, splitFillOnSpeaker } from '../ghostforge-server.js';
++
++const speech = [{ t: 1, end: 3, who: 'Marvin', cx: 0.2, cy: 0.4 }];
++
++test('valid focus lock prevents overlapping STT from replacing Detail FILL', () => {
++  const locked = [{ a: 0, b: 4, mode: 'fill', planMode: 'fill', focusLock: true, focalWho: 'Jeffy', focalCx: 0.72 }];
++  assert.deepEqual(applySpeechToWindows(locked, speech), locked);
++});
++
++test('unlocked Detail FILL keeps existing active-speaker STT behavior', () => {
++  const windows = [{ a: 0, b: 4, mode: 'fill', planMode: 'fill', cx: 0.72 }];
++  const result = applySpeechToWindows(windows, speech);
++  assert.equal(result.some((w) => w.who === 'Marvin' && w.cx === 0.2), true);
++});
++
++test('focus lock without valid focalCx keeps existing STT behavior', () => {
++  const windows = [{ a: 0, b: 4, mode: 'fill', planMode: 'fill', focusLock: true, focalWho: 'Jeffy' }];
++  const result = applySpeechToWindows(windows, speech);
++  assert.equal(result.some((w) => w.who === 'Marvin' && w.cx === 0.2), true);
++});
++
++test('speaker track does not split or retarget a valid focus-locked FILL', () => {
++  const locked = [{ a: 0, b: 4, mode: 'fill', planMode: 'fill', focusLock: true, focalWho: 'Jeffy', focalCx: 0.72 }];
++  const track = [
++    { t: 0.5, who: 'Marvin', cx: 0.2 },
++    { t: 2.5, who: 'Junior', cx: 0.8 },
++  ];
++  assert.deepEqual(splitFillOnSpeaker(locked, track), locked);
++});

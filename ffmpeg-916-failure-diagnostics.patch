@@ -1,0 +1,100 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -14,3 +14,4 @@
+ import { mapDiarizationEvidence, fallbackSpeechForAmbiguousTurns } from './server/local-listen-map.js';
+ import { runGoogleSttChunkWithRetry } from './server/google-stt-retry.js';
++import { firstMeaningfulFfmpegError } from './server/ffmpeg-diagnostics.js';
+ 
+@@ -1724,4 +1725,8 @@ const runFf = (args, job, opts = {}) => new Promise((resolve, reject) => {
+         if (job?.cancelled) return reject(new Error('cancelled'));
+         if (code === 0) resolve();
+-        else reject(new Error((err || `ffmpeg exit ${code}`).slice(-500)));
++        else {
++            const error = new Error((err || `ffmpeg exit ${code}`).slice(-500));
++            error.ffmpegFirstError = firstMeaningfulFfmpegError(err);
++            reject(error);
++        }
+     });
+@@ -1750,12 +1755,20 @@ const editEncoderLabel = (encoder) => encoder === 'nvidia'
+-const runEditEncode = async (prefix, suffix, job, quality = 20, fast = false) => {
++const runEditEncode = async (prefix, suffix, job, quality = 20, fast = false, diagnostics = null) => {
+     const selected = job?.editEncoder || 'cpu';
+     const attempts = selected === 'cpu' ? ['cpu'] : [selected, 'cpu'];
+     let lastError;
+     for (const encoder of attempts) {
++        const args = [...prefix, ...editEncoderArgs(encoder, quality, fast), ...suffix];
++        if (diagnostics) {
++            const argsLength = args.map((arg) => String(arg)).join(' ').length;
++            job?.editOnLog?.(`[EDIT] FFmpeg graph stats (${editEncoderLabel(encoder)}): hold=${diagnostics.hold} · xExpr=${diagnostics.xExpr} · yExpr=${diagnostics.yExpr} · filter=${diagnostics.filter} · args≈${argsLength}`);
++        }
+         try {
+-            await runFf([...prefix, ...editEncoderArgs(encoder, quality, fast), ...suffix], job);
++            await runFf(args, job);
+             if (job) job.editEncoder = encoder;
+             return encoder;
+         } catch (error) {
+             lastError = error;
++            if (diagnostics && error?.ffmpegFirstError) {
++                job?.editOnLog?.(`[EDIT] FFmpeg first error (${editEncoderLabel(encoder)}): ${error.ffmpegFirstError}`);
++            }
+             if (job?.cancelled || encoder === 'cpu') throw error;
+@@ -2495,4 +2508,9 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+             '-movflags', '+faststart',
+             destPath,
+-        ], job, 20, false);
++        ], job, 20, false, {
++            hold: locked.length,
++            xExpr: xExpr.length,
++            yExpr: yExpr.length,
++            filter: fc.length,
++        });
+     } finally {
+diff --git a/server/ffmpeg-diagnostics.js b/server/ffmpeg-diagnostics.js
+new file mode 100644
+--- /dev/null
++++ b/server/ffmpeg-diagnostics.js
+@@ -0,0 +1,11 @@
++const FFMPEG_ERROR_PATTERN = /error|invalid|unable|failed|undefined|no such|option|expression|parse|filter|crop/i;
++
++export const firstMeaningfulFfmpegError = (stderr) => {
++    const lines = String(stderr || '')
++        .split(/\r?\n/)
++        .map((line) => line.trim())
++        .filter(Boolean);
++    return lines.find((line) => FFMPEG_ERROR_PATTERN.test(line))
++        || lines.at(-1)
++        || 'ffmpeg failed without stderr output';
++};
+diff --git a/tests/ffmpeg-diagnostics.test.js b/tests/ffmpeg-diagnostics.test.js
+new file mode 100644
+--- /dev/null
++++ b/tests/ffmpeg-diagnostics.test.js
+@@ -0,0 +1,27 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { firstMeaningfulFfmpegError } from '../server/ffmpeg-diagnostics.js';
++
++test('firstMeaningfulFfmpegError returns the earliest useful error line', () => {
++    const stderr = [
++        'ffmpeg version 7.1',
++        'frame=  42 fps=30 time=00:00:01.40 speed=1x',
++        'Error when evaluating the expression x',
++        'Failed to configure input pad',
++    ].join('\n');
++    assert.equal(firstMeaningfulFfmpegError(stderr), 'Error when evaluating the expression x');
++});
++
++test('firstMeaningfulFfmpegError ignores irrelevant progress lines', () => {
++    const stderr = [
++        'frame=  42 fps=30 time=00:00:01.40 speed=1x',
++        'bitrate=1200.0kbits/s',
++        'Invalid argument',
++    ].join('\n');
++    assert.equal(firstMeaningfulFfmpegError(stderr), 'Invalid argument');
++});
++
++test('firstMeaningfulFfmpegError falls back safely without a keyword', () => {
++    assert.equal(firstMeaningfulFfmpegError('ffmpeg version 7.1\nconversion stopped'), 'conversion stopped');
++    assert.equal(firstMeaningfulFfmpegError(''), 'ffmpeg failed without stderr output');
++});

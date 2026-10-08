@@ -1,0 +1,65 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -2001,6 +2001,7 @@ const splitFillOnSpeaker = (windows, track) => {
+         let trackCy = inside[0].cy;
+         const pushPiece = (a, b) => out.push({
+             a, b, mode: 'fill',
++            planMode: w.planMode,
+             who: speechWho || trackWho || undefined,
+             why: speechWho || trackWho || w.why,
+             cx: Number.isFinite(w.cx)
+@@ -2111,6 +2112,10 @@ const applySpeechToWindows = (windows, speech) => {
+     }
+     const out = [];
+     for (const w of windows) {
++        if (w.planMode === 'contain') {
++            out.push(w);
++            continue;
++        }
+         if (forcedWhy(w)) {
+             out.push(w);
+             continue;
+@@ -2126,10 +2131,13 @@ const applySpeechToWindows = (windows, speech) => {
+         for (const f of hits) {
+             const a = Math.max(w.a, f.a);
+             const b = Math.min(w.b, f.b);
+-            if (a - cursor >= 0.5) out.push({ a: cursor, b: a, mode: 'contain', why: 'STT gap' });
++            if (a - cursor >= 0.5) out.push(w.planMode === 'fill'
++                ? { ...w, a: cursor, b: a }
++                : { a: cursor, b: a, mode: 'contain', why: 'STT gap' });
+             if (b - a >= 0.65) {
+                 out.push({
+                     a, b, mode: 'fill', why: f.who, who: f.who,
++                    planMode: w.planMode,
+                     cx: Number.isFinite(f.cx) ? f.cx : undefined,
+                     cy: Number.isFinite(f.cy) ? f.cy : undefined,
+                 });
+@@ -2137,7 +2145,9 @@ const applySpeechToWindows = (windows, speech) => {
+             }
+             cursor = Math.max(cursor, b);
+         }
+-        if (w.b - cursor >= 0.5) out.push({ a: cursor, b: w.b, mode: 'contain', why: 'STT tail' });
++        if (w.b - cursor >= 0.5) out.push(w.planMode === 'fill'
++            ? { ...w, a: cursor, b: w.b }
++            : { a: cursor, b: w.b, mode: 'contain', why: 'STT tail' });
+     }
+     return out.length ? out : windows;
+ };
+@@ -2152,6 +2162,8 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrac
+         const scenes = await detectSceneTimes(srcPath, dur, job);
+         windows = buildMixWindows(scenes, dur);
+         how = windows.length < 3 ? 'timer fallback' : 'scene fallback';
++    } else {
++        windows = windows.map((w) => ({ ...w, planMode: w.mode }));
+     }
+     const track = Array.isArray(speakerTrack) ? speakerTrack.filter((p) => p && Number.isFinite(p.t) && Number.isFinite(p.cx)) : [];
+     const speech = Array.isArray(speechLines) ? speechLines.filter((l) => l && Number.isFinite(l.t) && l.who) : [];
+@@ -2249,6 +2261,7 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrac
+             onLog?.(`[EDIT] Fill only ${fillSec.toFixed(0)}s — force STT talk windows back to fill`);
+             for (const w of windows) {
+                 if (w.mode === 'fill') continue;
++                if (w.planMode === 'contain') continue;
+                 const hit = speech.some((l) => l.end > w.a + 0.3 && l.t < w.b - 0.3);
+                 if (!hit || w.b - w.a < 0.8) continue;
+                 try {

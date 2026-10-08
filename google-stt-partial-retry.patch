@@ -1,0 +1,243 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -12,6 +12,7 @@ import { jobs, subscribeJob, jobSignal, abortJob, ensureAbort } from './server/j
+ import { createSaveDirStore } from './server/save-dir.js';
+ import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, isSpeakerIdentity, resolveSpeakerWho, validSpeakerTrackPoints, parseSpeechLines, sourceTimeForTrackPoint, normalizeFrameMode, stitchFrames, clamp01, parseFraming, parseSpeakerTrack, snapSpeakerTrack, clampPlan, parseGeminiPlan } from './server/editor-plan.js';
+ import { mapDiarizationEvidence, fallbackSpeechForAmbiguousTurns } from './server/local-listen-map.js';
++import { runGoogleSttChunkWithRetry } from './server/google-stt-retry.js';
+ 
+ const __dirname = path.dirname(fileURLToPath(import.meta.url));
+ const app = express();
+@@ -2984,11 +2985,10 @@ async function googleSttWords(auth, inputPath, duration, job, onLog) {
+     await runFf(['-y', '-i', inputPath, '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wav], job);
+     const chunkSec = 40;
+     const words = [];
+-    let disabled = false;
++    let skippedChunks = 0;
+     try {
+         for (let t = 0; t < duration + 0.01; t += chunkSec) {
+             if (job && job.cancelled) throw new Error('cancelled');
+-            if (disabled) break;
+             const part = `${wav}.${Math.round(t)}.wav`;
+             await runFf(['-y', '-ss', String(t), '-t', String(chunkSec + 0.35), '-i', wav, '-c', 'copy', part], job);
+             let b64 = '';
+@@ -2997,36 +2997,48 @@ async function googleSttWords(auth, inputPath, duration, job, onLog) {
+             } finally {
+                 try { fs.unlinkSync(part); } catch { /* ignore */ }
+             }
+-            const res = await fetch('https://speech.googleapis.com/v1/speech:recognize', {
+-                method: 'POST',
+-                headers: {
+-                    Authorization: `Bearer ${auth.token}`,
+-                    'Content-Type': 'application/json',
+-                    'x-goog-user-project': auth.project,
++            const chunkEnd = Math.min(duration, t + chunkSec);
++            const result = await runGoogleSttChunkWithRetry({
++                request: async () => {
++                    const res = await fetch('https://speech.googleapis.com/v1/speech:recognize', {
++                        method: 'POST',
++                        headers: {
++                            Authorization: `Bearer ${auth.token}`,
++                            'Content-Type': 'application/json',
++                            'x-goog-user-project': auth.project,
++                        },
++                        body: JSON.stringify({
++                            config: {
++                                encoding: 'LINEAR16',
++                                sampleRateHertz: 16000,
++                                languageCode: 'en-US',
++                                enableWordTimeOffsets: true,
++                                model: 'latest_long',
++                            },
++                            audio: { content: b64 },
++                        }),
++                        signal: jobSignal(job, 120000),
++                    });
++                    const j = await res.json().catch(() => ({}));
++                    return { ok: res.ok, status: res.status, j };
+                 },
+-                body: JSON.stringify({
+-                    config: {
+-                        encoding: 'LINEAR16',
+-                        sampleRateHertz: 16000,
+-                        languageCode: 'en-US',
+-                        enableWordTimeOffsets: true,
+-                        model: 'latest_long',
+-                    },
+-                    audio: { content: b64 },
+-                }),
+-                signal: jobSignal(job, 120000),
++                wait: (ms) => sleepJob(ms, job),
++                isCancelled: () => Boolean(job?.cancelled),
++                onRetry: ({ attempt, maxAttempts, reason, delayMs }) => onLog?.(
++                    `[EDIT] Google STT chunk ${t.toFixed(0)}-${chunkEnd.toFixed(0)}s attempt ${attempt}/${maxAttempts} failed: ${reason} — retry in ${Math.round(delayMs / 1000)}s`,
++                ),
+             });
+-            const j = await res.json().catch(() => ({}));
+-            if (!res.ok) {
+-                const msg = j.error?.message || `STT ${res.status}`;
+-                if (res.status === 403 || res.status === 404) {
+-                    onLog?.(`[EDIT] Google Speech-to-Text chưa bật trên project — dùng mốc Gemini nghe. (${msg.slice(0, 80)})`);
+-                    disabled = true;
+-                    break;
++            if (!result.ok) {
++                skippedChunks += 1;
++                if (result.permanent) {
++                    const msg = result.response?.j?.error?.message || result.reason;
++                    onLog?.(`[EDIT] STT chunk ${t.toFixed(0)}-${chunkEnd.toFixed(0)}s skipped: ${msg}`.slice(0, 220));
++                } else {
++                    onLog?.(`[EDIT] Google STT chunk ${t.toFixed(0)}-${chunkEnd.toFixed(0)}s skipped after ${result.attempts} attempts`);
+                 }
+-                onLog?.(`[EDIT] STT chunk ${t.toFixed(0)}s: ${msg}`.slice(0, 220));
+                 continue;
+             }
++            const j = result.response.j;
+             for (const r of j.results || []) {
+                 for (const alt of r.alternatives || []) {
+                     for (const w of alt.words || []) {
+@@ -3039,6 +3051,9 @@ async function googleSttWords(auth, inputPath, duration, job, onLog) {
+             }
+             onLog?.(`[EDIT] STT words ${words.length} through ${Math.min(duration, t + chunkSec).toFixed(0)}s`);
+         }
++        if (skippedChunks && words.length) {
++            onLog?.(`[EDIT] Google STT partial: ${words.length} words kept · ${skippedChunks} chunk${skippedChunks === 1 ? '' : 's'} skipped`);
++        }
+     } finally {
+         try { fs.unlinkSync(wav); } catch { /* ignore */ }
+     }
+diff --git a/server/google-stt-retry.js b/server/google-stt-retry.js
+new file mode 100644
+--- /dev/null
++++ b/server/google-stt-retry.js
+@@ -0,0 +1,37 @@
++const transientStatus = (status) => status === 429 || status >= 500;
++
++const failureMessage = (error) => {
++  const message = error instanceof Error ? error.message : String(error || 'request failed');
++  return message.replace(/\s+/g, ' ').trim().slice(0, 120) || 'request failed';
++};
++
++export async function runGoogleSttChunkWithRetry({
++  request,
++  wait,
++  isCancelled = () => false,
++  onRetry,
++  maxAttempts = 3,
++  retryDelaysMs = [2000, 5000],
++}) {
++  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
++    if (isCancelled()) throw new Error('cancelled');
++    let response;
++    let reason = '';
++    try {
++      response = await request(attempt);
++      if (response?.ok) return { ok: true, response, attempts: attempt };
++      reason = `HTTP ${Number(response?.status) || 0}`;
++      if (!transientStatus(Number(response?.status))) {
++        return { ok: false, permanent: true, response, reason, attempts: attempt };
++      }
++    } catch (error) {
++      if (isCancelled() || /^cancelled$/i.test(failureMessage(error))) throw error;
++      reason = failureMessage(error);
++    }
++    if (attempt >= maxAttempts) return { ok: false, skipped: true, reason, attempts: attempt };
++    const delayMs = retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)] || 0;
++    onRetry?.({ attempt, maxAttempts, reason, delayMs });
++    await wait(delayMs);
++  }
++  return { ok: false, skipped: true, reason: 'request failed', attempts: maxAttempts };
++}
+diff --git a/tests/google-stt-retry.test.js b/tests/google-stt-retry.test.js
+new file mode 100644
+--- /dev/null
++++ b/tests/google-stt-retry.test.js
+@@ -0,0 +1,88 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { runGoogleSttChunkWithRetry } from '../server/google-stt-retry.js';
++
++const run = (request, extra = {}) => {
++  const waits = [];
++  return runGoogleSttChunkWithRetry({
++    request,
++    wait: async (ms) => { waits.push(ms); },
++    ...extra,
++  }).then((result) => ({ result, waits }));
++};
++
++test('Google STT chunk succeeds without retry', async () => {
++  const { result, waits } = await run(async () => ({ ok: true, status: 200, words: ['a'] }));
++  assert.equal(result.ok, true);
++  assert.equal(result.attempts, 1);
++  assert.deepEqual(waits, []);
++});
++
++test('Google STT chunk retries a fetch failure then succeeds', async () => {
++  let calls = 0;
++  const { result, waits } = await run(async () => {
++    calls += 1;
++    if (calls === 1) throw new Error('fetch failed');
++    return { ok: true, status: 200 };
++  });
++  assert.equal(result.ok, true);
++  assert.equal(calls, 2);
++  assert.deepEqual(waits, [2000]);
++});
++
++test('Google STT chunk retries HTTP 429 then succeeds', async () => {
++  let calls = 0;
++  const { result } = await run(async () => (++calls === 1
++    ? { ok: false, status: 429 }
++    : { ok: true, status: 200 }));
++  assert.equal(result.ok, true);
++  assert.equal(calls, 2);
++});
++
++test('Google STT chunk skips exhausted HTTP 5xx', async () => {
++  let calls = 0;
++  const { result, waits } = await run(async () => {
++    calls += 1;
++    return { ok: false, status: 503 };
++  });
++  assert.equal(result.skipped, true);
++  assert.equal(calls, 3);
++  assert.deepEqual(waits, [2000, 5000]);
++});
++
++test('Google STT chunk skips permanent HTTP 4xx without retry', async () => {
++  let calls = 0;
++  const { result } = await run(async () => {
++    calls += 1;
++    return { ok: false, status: 400 };
++  });
++  assert.equal(result.permanent, true);
++  assert.equal(calls, 1);
++});
++
++test('late Google STT chunk failure preserves earlier accumulated words', async () => {
++  const words = [];
++  const requests = [
++    async () => ({ ok: true, status: 200, words: ['early'] }),
++    async () => { throw new Error('fetch failed'); },
++    async () => ({ ok: true, status: 200, words: ['later'] }),
++  ];
++  for (const request of requests) {
++    const { result } = await run(request);
++    if (result.ok) words.push(...result.response.words);
++  }
++  assert.deepEqual(words, ['early', 'later']);
++});
++
++test('Google STT cancellation aborts immediately', async () => {
++  let calls = 0;
++  await assert.rejects(
++    runGoogleSttChunkWithRetry({
++      request: async () => { calls += 1; throw new Error('cancelled'); },
++      wait: async () => {},
++      isCancelled: () => true,
++    }),
++    /cancelled/,
++  );
++  assert.equal(calls, 0);
++});

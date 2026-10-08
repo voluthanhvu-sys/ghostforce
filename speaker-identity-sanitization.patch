@@ -1,0 +1,295 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -10,7 +10,7 @@ import { fileURLToPath } from 'url';
+ import { runProcess } from './server/process.js';
+ import { jobs, subscribeJob, jobSignal, abortJob, ensureAbort } from './server/jobs.js';
+ import { createSaveDirStore } from './server/save-dir.js';
+-import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, sourceTimeForTrackPoint, normalizeFrameMode, stitchFrames, clamp01, parseFraming, parseSpeakerTrack, snapSpeakerTrack, clampPlan, parseGeminiPlan } from './server/editor-plan.js';
++import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, isSpeakerIdentity, resolveSpeakerWho, validSpeakerTrackPoints, parseSpeechLines, sourceTimeForTrackPoint, normalizeFrameMode, stitchFrames, clamp01, parseFraming, parseSpeakerTrack, snapSpeakerTrack, clampPlan, parseGeminiPlan } from './server/editor-plan.js';
+ import { mapDiarizationEvidence, fallbackSpeechForAmbiguousTurns } from './server/local-listen-map.js';
+ 
+ const __dirname = path.dirname(fileURLToPath(import.meta.url));
+@@ -2137,12 +2137,12 @@ const splitFillOnSpeaker = (windows, track) => {
+             .filter((p) => p.t >= w.a - 0.08 && p.t <= w.b + 0.08)
+             .sort((a, b) => a.t - b.t);
+         if (inside.length < 2) {
+-            out.push(w);
++            out.push({ ...w, who: resolveSpeakerWho({ windowWho: w.who }) });
+             continue;
+         }
+         let a0 = w.a;
+-        const speechWho = String(w.who || '').trim();
+-        let trackWho = String(inside[0].who || w.why || '');
++        const speechWho = resolveSpeakerWho({ windowWho: w.who }) || '';
++        let trackWho = resolveSpeakerWho({ trackWho: inside[0].who }) || '';
+         let trackCx = inside[0].cx;
+         let trackCy = inside[0].cy;
+         const pushPiece = (a, b) => out.push({
+@@ -2159,7 +2159,7 @@ const splitFillOnSpeaker = (windows, track) => {
+         });
+         for (let i = 1; i < inside.length; i++) {
+             const p = inside[i];
+-            const pWho = String(p.who || '');
++            const pWho = resolveSpeakerWho({ trackWho: p.who }) || '';
+             const jump = (trackWho && pWho && trackWho.toLowerCase() !== pWho.toLowerCase())
+                 || (Number.isFinite(trackCx) && Number.isFinite(p.cx) && Math.abs(p.cx - trackCx) > 0.13);
+             if (jump && p.t - a0 >= 0.85 && w.b - p.t >= 0.85) {
+@@ -2179,6 +2179,7 @@ const cxForWhoAt = (who, t, track, fallback) => {
+     const name = String(who || '').toLowerCase().trim();
+     if (!name || !Array.isArray(track) || !track.length) return fallback;
+     const pts = track.filter((p) => {
++        if (!isSpeakerIdentity(p.who)) return false;
+         const w = String(p.who || '').toLowerCase();
+         return w && (w === name || w.includes(name) || name.includes(w));
+     });
+@@ -2195,6 +2196,7 @@ const cxForWhoAt = (who, t, track, fallback) => {
+ const buildSeatLock = (speech, track) => {
+     const samples = {};
+     const add = (who, cx) => {
++        if (!isSpeakerIdentity(who)) return;
+         const k = String(who || '').toLowerCase().trim();
+         if (!k || k === 'unknown' || k === 'narrator') return;
+         if (!Number.isFinite(cx)) return;
+@@ -2342,10 +2344,11 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+         if (w.mode !== 'fill') continue;
+         if (job?.cancelled) throw new Error('cancelled');
+         const tLock = Math.max(0.04, w.a + 0.04);
+-        const named = w.who || w.why || '';
+-        const nowCx = cxForWhoAt(named, tLock, track, NaN);
++        const speakerWho = resolveSpeakerWho({ windowWho: w.who }) || '';
++        const displayLabel = speakerWho || w.why || '';
++        const nowCx = cxForWhoAt(speakerWho, tLock, track, NaN);
+         const lineCx = Number.isFinite(w.cx) ? w.cx : NaN;
+-        const locked = seatCx(named, seats, NaN);
++        const locked = seatCx(speakerWho, seats, NaN);
+         const wantCx = [lineCx, nowCx, locked].find((v) => Number.isFinite(v));
+         const hint = Number.isFinite(wantCx) ? wantCx : hintCxAt(tLock, w, track);
+         const cy = Number.isFinite(w.cy) ? w.cy : 0.40;
+@@ -2362,7 +2365,7 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+             onLog?.(`[EDIT]   fill→wide ${Number(w.a).toFixed(1)}–${Number(w.b).toFixed(1)}s  (no puppet)`);
+             continue;
+         }
+-        if (!named && sampled0.closeup && !sampled0.twoShot) {
++        if (!speakerWho && sampled0.closeup && !sampled0.twoShot) {
+             w.mode = 'contain';
+             demoted += 1;
+             onLog?.(`[EDIT]   fill→wide ${Number(w.a).toFixed(1)}–${Number(w.b).toFixed(1)}s  (already CU, no STT who)`);
+@@ -2373,8 +2376,8 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+         w.cy = cy;
+         const origB = w.b;
+         const side = cx < 0.5 ? 'LEFT' : 'RIGHT';
+-        onLog?.(`[EDIT]   FILL ${Number(w.a).toFixed(1)}–${Number(w.b).toFixed(1)}s  ${named || 'talk'}  ${side} cx ${cx.toFixed(2)}${sampled0.twoShot ? ' two-shot' : ''}`);
+-        pts.push({ t: Math.max(0, w.a), cx, cy, who: w.why || '' });
++        onLog?.(`[EDIT]   FILL ${Number(w.a).toFixed(1)}–${Number(w.b).toFixed(1)}s  ${displayLabel || 'talk'}  ${side} cx ${cx.toFixed(2)}${sampled0.twoShot ? ' two-shot' : ''}`);
++        pts.push({ t: Math.max(0, w.a), cx, cy, who: speakerWho });
+         for (let t = w.a + 0.9; t < origB - 0.55; t += 0.9) {
+             try {
+                 const mid = await sampleTalkerTimed(t);
+@@ -2384,19 +2387,19 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+                     onLog?.(`[EDIT]   fill ends ${t.toFixed(1)}s → wide (no puppet)`);
+                     break;
+                 }
+-                const now2 = cxForWhoAt(named, t, track, NaN);
+-                const hold = Number.isFinite(now2) ? now2 : seatCx(named, seats, cx);
++                const now2 = cxForWhoAt(speakerWho, t, track, NaN);
++                const hold = Number.isFinite(now2) ? now2 : seatCx(speakerWho, seats, cx);
+                 const cx2 = snapToPeak(hold, mid.peaks);
+                 if (Math.abs(cx2 - cx) > 0.18) {
+-                    pts.push({ t: Math.max(w.a + 0.03, t - 0.03), cx, cy, who: w.why || '' });
++                    pts.push({ t: Math.max(w.a + 0.03, t - 0.03), cx, cy, who: speakerWho });
+                     cx = cx2;
+                     w.cx = cx2;
+-                    pts.push({ t, cx: cx2, cy, who: w.why || '' });
++                    pts.push({ t, cx: cx2, cy, who: speakerWho });
+                     onLog?.(`[EDIT]   CUT ${t.toFixed(1)}s → ${cx2 < 0.5 ? 'LEFT' : 'RIGHT'} ${cx2.toFixed(2)}`);
+                 }
+             } catch { /* keep */ }
+         }
+-        pts.push({ t: Math.max(w.a + 0.03, w.b), cx, cy, who: w.why || '' });
++        pts.push({ t: Math.max(w.a + 0.03, w.b), cx, cy, who: speakerWho });
+     }
+     {
+         const fillSec = windows.filter((w) => w.mode === 'fill').reduce((s, w) => s + (w.b - w.a), 0);
+@@ -2414,14 +2417,14 @@ const mixFrameClip = async (srcPath, destPath, job, onLog, planned, speakerTrack
+                 } catch { continue; }
+                 const line = speech.find((l) => l.end > w.a + 0.2 && l.t < w.b - 0.2);
+                 w.mode = 'fill';
+-                w.who = line?.who || w.why;
++                w.who = resolveSpeakerWho({ windowWho: line?.who });
+                 w.why = w.who || w.why;
+                 w.cx = Number.isFinite(line?.cx) ? line.cx : w.cx;
+                 onLog?.(`[EDIT]   FORCE FILL ${Number(w.a).toFixed(1)}–${Number(w.b).toFixed(1)}s  ${w.who || ''}`);
+                 const cx = Number.isFinite(w.cx) ? w.cx : 0.5;
+                 const cy = Number.isFinite(w.cy) ? w.cy : 0.40;
+-                pts.push({ t: w.a, cx, cy, who: w.why || '' });
+-                pts.push({ t: w.b, cx, cy, who: w.why || '' });
++                pts.push({ t: w.a, cx, cy, who: w.who || '' });
++                pts.push({ t: w.b, cx, cy, who: w.who || '' });
+             }
+         }
+     }
+@@ -2784,33 +2787,6 @@ const parseJsonObject = (text) => {
+     return JSON.parse(jsonText.slice(start, end + 1));
+ };
+ 
+-const parseSpeechLines = (parsed, duration) => {
+-    const arr = (parsed && (parsed.lines || parsed.speech || parsed.utterances)) || [];
+-    const dur = Math.max(0.2, Number(duration) || 0);
+-    const out = [];
+-    for (const l of arr) {
+-        if (!l) continue;
+-        const t = Number(l.t ?? l.start ?? l.begin);
+-        let end = Number(l.end ?? l.stop);
+-        const who = String(l.who || l.speaker || '').trim().slice(0, 28);
+-        if (!Number.isFinite(t) || !who) continue;
+-        if (!Number.isFinite(end) || end <= t) end = t + 1.4;
+-        const rec = {
+-            t: Math.max(0, Math.min(dur, t)),
+-            end: Math.max(0, Math.min(dur, end)),
+-            who,
+-            text: String(l.text || l.line || '').slice(0, 140),
+-        };
+-        const cx = Number(l.cx);
+-        const cy = Number(l.cy);
+-        if (Number.isFinite(cx)) rec.cx = Math.min(0.92, Math.max(0.08, cx));
+-        if (Number.isFinite(cy)) rec.cy = Math.min(0.72, Math.max(0.20, cy));
+-        out.push(rec);
+-    }
+-    out.sort((a, b) => a.t - b.t);
+-    return out;
+-};
+-
+ const sttListenPrompt = (duration) => `LISTEN to this entire video. You are a stenographer for SuperMarioLogan puppets.
+ Return JSON only:
+ {"lines":[{"t":0.12,"end":1.85,"who":"Brooklyn","cx":0.18,"cy":0.42,"text":"Y'all ass I wasn't invited"}]}
+@@ -3077,8 +3053,7 @@ const planSpeakerIntervals = (plan) => {
+         const pieces = Array.isArray(seg.pieces) && seg.pieces.length
+             ? seg.pieces
+             : [{ start: base, end }];
+-        const pts = (Array.isArray(seg.track) ? seg.track : [])
+-            .filter((p) => p && Number.isFinite(p.t) && String(p.who || '').trim())
++        const pts = validSpeakerTrackPoints(seg.track)
+             .map((p) => {
+                 const sourceT = sourceTimeForTrackPoint(pieces, p.t, base);
+                 const piece = pieces.find((x) => sourceT >= Number(x.start) && sourceT <= Number(x.end));
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -52,6 +52,50 @@ export const scriptLabel = (pieces) => pieces.map((p) => {
+     return `${tag}${p.start}–${p.end}`;
+ }).join(' > ');
+ 
++export const isSpeakerIdentity = (value) => {
++    const name = String(value || '').trim().replace(/\s+/g, ' ');
++    if (!name || name.length > 48) return false;
++    const words = name.split(' ');
++    if (words.length < 1 || words.length > 4) return false;
++    return words.every((word) => /^[\p{L}\p{M}][\p{L}\p{M}'’.-]*$/u.test(word));
++};
++
++export const resolveSpeakerWho = ({ windowWho, trackWho } = {}) => {
++    const value = [windowWho, trackWho].find(isSpeakerIdentity);
++    return value == null ? undefined : String(value).trim().replace(/\s+/g, ' ');
++};
++
++export const validSpeakerTrackPoints = (track) => (Array.isArray(track) ? track : [])
++    .filter((point) => point && Number.isFinite(point.t) && isSpeakerIdentity(point.who));
++
++export const parseSpeechLines = (parsed, duration) => {
++    const arr = (parsed && (parsed.lines || parsed.speech || parsed.utterances)) || [];
++    const dur = Math.max(0.2, Number(duration) || 0);
++    const out = [];
++    for (const line of arr) {
++        if (!line) continue;
++        const t = Number(line.t ?? line.start ?? line.begin);
++        let end = Number(line.end ?? line.stop);
++        const rawWho = String(line.who || line.speaker || '').trim().slice(0, 48);
++        const who = isSpeakerIdentity(rawWho) ? rawWho : undefined;
++        if (!Number.isFinite(t)) continue;
++        if (!Number.isFinite(end) || end <= t) end = t + 1.4;
++        const rec = {
++            t: Math.max(0, Math.min(dur, t)),
++            end: Math.max(0, Math.min(dur, end)),
++            text: String(line.text || line.line || '').slice(0, 140),
++        };
++        if (who) rec.who = who;
++        const cx = Number(line.cx);
++        const cy = Number(line.cy);
++        if (Number.isFinite(cx)) rec.cx = Math.min(0.92, Math.max(0.08, cx));
++        if (Number.isFinite(cy)) rec.cy = Math.min(0.72, Math.max(0.20, cy));
++        out.push(rec);
++    }
++    out.sort((a, b) => a.t - b.t);
++    return out;
++};
++
+ export const sourceTimeForTrackPoint = (pieces, trackTime, fallbackStart = 0) => {
+     const t = Number(trackTime);
+     const valid = (Array.isArray(pieces) ? pieces : [])
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan, sourceTimeForTrackPoint } from '../server/editor-plan.js';
++import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan, sourceTimeForTrackPoint, isSpeakerIdentity, resolveSpeakerWho, parseSpeechLines } from '../server/editor-plan.js';
+ 
+ test('evenSplitPlan creates contiguous bounded segments', () => {
+   const segs = evenSplitPlan(360, 3, 60, false);
+@@ -34,3 +34,27 @@ test('sourceTimeForTrackPoint maps concatenated time into the second piece', ()
+   const pieces = [{ start: 10, end: 15 }, { start: 40, end: 50 }];
+   assert.equal(sourceTimeForTrackPoint(pieces, 7, 10), 42);
+ });
++
++test('speaker identity accepts normal aliases and rejects narrative text', () => {
++  for (const name of ['Brooklyn Guy', 'Chef Pee Pee', "Cody's Dad", 'Brooklyn-Guy', 'Mr. Goodman']) {
++    assert.equal(isSpeakerIdentity(name), true, name);
++  }
++  assert.equal(isSpeakerIdentity('Puppet laughs at the TV and heads to bed'), false);
++  assert.equal(isSpeakerIdentity('Junior walks into the room'), false);
++});
++
++test('framing why is not promoted into speaker who', () => {
++  assert.equal(resolveSpeakerWho({ why: 'Puppet laughs at the TV and heads to bed' }), undefined);
++});
++
++test('invalid PLAN speech who is removed without dropping the line', () => {
++  const lines = parseSpeechLines({ lines: [{
++    t: 1,
++    end: 2,
++    who: 'Puppet laughs at the TV and heads to bed',
++    text: 'Good night',
++  }] }, 10);
++  assert.equal(lines.length, 1);
++  assert.equal(lines[0].who, undefined);
++  assert.equal(lines[0].text, 'Good night');
++});
+diff --git a/tests/local-listen-map.test.js b/tests/local-listen-map.test.js
+--- a/tests/local-listen-map.test.js
++++ b/tests/local-listen-map.test.js
+@@ -1,5 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
++import { validSpeakerTrackPoints } from '../server/editor-plan.js';
+ import { mapDiarizationEvidence, fallbackSpeechForAmbiguousTurns } from '../server/local-listen-map.js';
+ 
+ const range = [{ start: 0, end: 20 }];
+@@ -79,3 +80,15 @@ test('fallback speech is restricted to unresolved time and excludes local mapped
+   const result = fallbackSpeechForAmbiguousTurns(fallback, ambiguous, mapped);
+   assert.deepEqual(result.map((x) => [x.t, x.end, x.who]), [[3, 4, 'Junior']]);
+ });
++
++test('invalid PLAN track identity does not participate in Local Listen mapping', () => {
++  const track = [{ t: 1, cx: 0.5, cy: 0.4, who: 'Puppet laughs at the TV and heads to bed' }];
++  const valid = validSpeakerTrackPoints(track);
++  const mapped = mapDiarizationEvidence(
++    [{ start: 0, end: 2, speakerId: 'SPEAKER_00' }],
++    valid,
++    [{ start: 0, end: 2 }],
++  );
++  assert.deepEqual(valid, []);
++  assert.equal(mapped.ok, false);
++});
+

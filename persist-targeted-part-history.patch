@@ -1,0 +1,233 @@
+diff --git "a/ghostforge-server.js" b/ghostforge-server.js
+index 10ed8b6..3182e73 100644
+--- "a/ghostforge-server.js"
++++ b/ghostforge-server.js
+@@ -41,6 +41,23 @@ const saveDirFile = path.join(uploadsDir, 'save-dir.json');
+ const saveDirStore = createSaveDirStore(saveDirFile);
+ const readSaveDir = () => saveDirStore.read();
+ const writeSaveDir = (dir) => saveDirStore.write(dir);
++const editPartHistoryFile = path.join(uploadsDir, 'edit-part-test-history.json');
++
++function readEditPartHistory() {
++    try {
++        const parsed = JSON.parse(fs.readFileSync(editPartHistoryFile, 'utf8'));
++        return parsed && Array.isArray(parsed.parts) ? parsed : null;
++    } catch {
++        return null;
++    }
++}
++
++function writeEditPartHistory(manifest) {
++    const tempFile = `${editPartHistoryFile}.tmp`;
++    fs.writeFileSync(tempFile, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
++    fs.renameSync(tempFile, editPartHistoryFile);
++}
++
+ let encoderCaps = null;
+ 
+ const ffmpegEnv = { ...process.env, CUDA_VISIBLE_DEVICES: '0' };
+@@ -3827,6 +3844,30 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                     ? `Không còn tập trong khoảng ${partFrom}–${partTo || 'hết'}. Tắt “Xuất tập từ 4–6” hoặc hạ số xuống 1.`
+                     : 'No clips longer than 1 minute — Gemini plan was too short'));
+         }
++        const completedWholeRun = testSec <= 0
++            && partFrom === 1
++            && (partTo === 0 || partTo >= plan.segments.length);
++        if (completedWholeRun) {
++            writeEditPartHistory({
++                version: 1,
++                id: crypto.randomBytes(12).toString('hex'),
++                completedAt: new Date().toISOString(),
++                sourcePath: path.resolve(job.inputPath),
++                sourceName: String(job.originalName || path.basename(job.inputPath)),
++                sourceWidth: Number(probe.width) || 0,
++                sourceHeight: Number(probe.height) || 0,
++                parts: cutSegs.map((part) => ({
++                    partIndex: part.partIndex,
++                    name: part.name,
++                    title: part.title,
++                    start: part.start,
++                    end: part.end,
++                    pieces: part.pieces,
++                    ranges: part.ranges,
++                })),
++            });
++            send('log', { message: `[EDIT] Saved targeted replay history: ${cutSegs.length} part(s)` });
++        }
+         send('progress', { value: 100 });
+         send('log', { message: `[EDIT] SUCCESS: ${cutSegs.length} clip(s) cut.` });
+         send('done', { segments: cutSegs, cut: true });
+@@ -3859,19 +3900,59 @@ function targetedPartRanges(segment) {
+     return ranges;
+ }
+ 
++app.get('/api/edit/part-test/history', (_req, res) => {
++    const manifest = readEditPartHistory();
++    if (!manifest) return res.json({ run: null });
++    let sourceAvailable = false;
++    try { sourceAvailable = fs.statSync(manifest.sourcePath).isFile(); } catch { /* unavailable */ }
++    res.json({
++        run: {
++            id: manifest.id,
++            completedAt: manifest.completedAt,
++            sourceName: manifest.sourceName,
++            sourceWidth: manifest.sourceWidth,
++            sourceHeight: manifest.sourceHeight,
++            sourceAvailable,
++            parts: manifest.parts,
++        },
++    });
++});
++
+ app.post('/api/edit/part-test', (req, res) => {
+     try {
+-        const parentPart = jobs.get(String(req.body?.partJobId || ''));
+-        if (!parentPart || parentPart.kind !== 'edit-part' || !parentPart.inputPath || !fs.existsSync(parentPart.inputPath)) {
+-            return res.status(404).json({ error: 'Original source for this part is no longer available' });
++        const requestedHistoryId = String(req.body?.historyId || '');
++        const requestedPartIndex = Math.max(1, Number(req.body?.partIndex) || Number(req.body?.segment?.partIndex) || 1);
++        const history = requestedHistoryId ? readEditPartHistory() : null;
++        let inputPath;
++        let originalName;
++        let segment;
++        if (history && history.id === requestedHistoryId) {
++            const persistedPart = history.parts.find((part) => Number(part.partIndex) === requestedPartIndex);
++            if (!persistedPart) return res.status(404).json({ error: 'Persisted part was not found' });
++            inputPath = history.sourcePath;
++            originalName = history.sourceName;
++            segment = persistedPart;
++        } else {
++            const parentPart = jobs.get(String(req.body?.partJobId || ''));
++            if (!parentPart || parentPart.kind !== 'edit-part') {
++                return res.status(404).json({ error: 'Original source metadata for this part is unavailable' });
++            }
++            inputPath = parentPart.inputPath;
++            originalName = parentPart.originalName;
++            segment = req.body?.segment || {};
++        }
++        let sourceIsFile = false;
++        try { sourceIsFile = fs.statSync(inputPath).isFile(); } catch { /* unavailable */ }
++        if (!sourceIsFile) {
++            return res.status(404).json({ error: 'Original landscape source no longer exists' });
+         }
+-        const segment = req.body?.segment || {};        const ranges = targetedPartRanges(segment);
++        const ranges = targetedPartRanges(segment);
+         const jobId = crypto.randomBytes(16).toString('hex');
+         jobs.set(jobId, {
+             kind: 'edit-part-test',
+-            inputPath: parentPart.inputPath,
++            inputPath,
+             keepInput: true,
+-            originalName: parentPart.originalName,
++            originalName,
+             segment: { ...segment, ranges },
+             partIndex: Math.max(1, Number(segment.partIndex) || 1),
+             settings: {
+diff --git "a/src/ghostforge-app.tsx" "b/src/ghostforge-app.tsx"
+index 3490dc9..cac75e5 100644
+--- "a/src/ghostforge-app.tsx"
++++ "b/src/ghostforge-app.tsx"
+@@ -126,6 +126,7 @@ export default function App() {
+         } catch { return 'auto'; }
+     });
+     const [editSegments, setEditSegments] = useState<EditSegment[]>([]);
++    const [partTestHistory, setPartTestHistory] = useState<EditSegment[]>([]);
+     const [editRenamingId, setEditRenamingId] = useState<string | null>(null);
+     const [editSelectedIds, setEditSelectedIds] = useState<string[]>([]);
+     const editInputRef = useRef<HTMLInputElement>(null);
+@@ -282,6 +283,28 @@ export default function App() {
+             .catch(() => {});
+     }, [addLog]);
+ 
++    useEffect(() => {
++        fetch(`${BACKEND_URL}/api/edit/part-test/history`)
++            .then((response) => response.json())
++            .then((data) => {
++                const run = data?.run;
++                if (!run?.id || !Array.isArray(run.parts)) return;
++                setPartTestHistory(run.parts.map((part: EditSegment) => ({
++                    ...part,
++                    id: `history-${run.id}-${part.partIndex}`,
++                    sourceId: `history-${run.id}`,
++                    sourceName: run.sourceName || 'Nguồn Edit gần nhất',
++                    parts: run.parts.length,
++                    status: 'planned' as const,
++                    historyId: run.id,
++                    sourceAvailable: Boolean(run.sourceAvailable),
++                    jobId: undefined,
++                    downloadUrl: undefined,
++                })));
++            })
++            .catch(() => {});
++    }, []);
++
+     useEffect(() => {
+         (async () => {
+             const dir = await loadDirHandle();
+@@ -724,7 +747,7 @@ export default function App() {
+     };
+ 
+     const testEditPart = async (seg: EditSegment) => {
+-        if (editBusyRef.current || !seg.jobId) return;
++        if (editBusyRef.current || (!seg.jobId && !seg.historyId)) return;
+         const hasPieces = Boolean((seg.pieces?.length || 0) > 0 || (seg.ranges?.length || 0) > 0);
+         if (!hasPieces && !(Number.isFinite(seg.start) && Number.isFinite(seg.end))) {
+             addLog('[EDIT] TARGETED PART TEST ERROR: Part này thiếu pieces/ranges hoặc start/end.');
+@@ -742,6 +765,8 @@ export default function App() {
+                 headers: { 'Content-Type': 'application/json' },
+                 body: JSON.stringify({
+                     partJobId: seg.jobId,
++                    historyId: seg.historyId,
++                    partIndex: seg.partIndex,
+                     segment: {
+                         name: seg.name,
+                         title: seg.title,
+@@ -786,6 +811,8 @@ export default function App() {
+                             ranges: data.ranges || seg.ranges,
+                             status: 'cut',
+                             jobId: data.jobId,
++                            historyId: undefined,
++                            sourceAvailable: true,
+                             downloadUrl: data.downloadUrl,
+                             saved: false,
+                             savedTo: undefined,
+@@ -3109,6 +3136,29 @@ export default function App() {
+                                 {saveNotice}
+                             </div>
+                         )}
++                        {partTestHistory.length > 0 && (
++                            <div className="mb-4 rounded-xl border border-cyan-900/70 bg-cyan-950/20 p-3">
++                                <div className="text-xs font-bold text-cyan-300 mb-2">Part đã chạy gần nhất</div>
++                                <div className="text-[10px] text-gray-500 mb-2">
++                                    Nguồn: {partTestHistory[0].sourceName}
++                                    {!partTestHistory[0].sourceAvailable ? ' · nguồn gốc không còn tồn tại' : ''}
++                                </div>
++                                <div className="flex flex-wrap gap-2">
++                                    {partTestHistory.map((part) => (
++                                        <button
++                                            key={part.id}
++                                            type="button"
++                                            onClick={() => void testEditPart(part)}
++                                            disabled={editBusy || !part.sourceAvailable}
++                                            className="text-[11px] font-bold px-3 py-1.5 rounded bg-cyan-700 hover:bg-cyan-600 disabled:bg-gray-800 disabled:text-gray-600 text-white"
++                                            title={part.sourceAvailable ? `Test lại ${part.title || part.name}` : 'File nguồn gốc không còn tồn tại'}
++                                        >
++                                            Test lại Part {part.partIndex}
++                                        </button>
++                                    ))}
++                                </div>
++                            </div>
++                        )}
+                         {editSegments.length === 0 ? (
+                             <p className="text-sm text-gray-500">
+                                 Drop video, prompt sẵn SML, ADC login, bấm GEMINI WATCH & CUT.
+diff --git "a/src/types.ts" "b/src/types.ts"
+index bd30aae..652d5ef 100644
+--- "a/src/types.ts"
++++ "b/src/types.ts"
+@@ -6,4 +6,4 @@ export interface ProcessingStats {
+ }
+ export interface QueueResult { name: string; originalName: string; jobId: string; downloadUrl: string; stats?: ProcessingStats; saved?: boolean; savedTo?: string; savedFile?: string; failed?: boolean; error?: string; }
+ export interface QueueClip { id: string; file: File; name: string; originalName: string; outFolder?: string; localPath?: string; fileSize?: number; }
+-export interface EditSegment { id: string; sourceId: string; sourceName: string; name: string; title?: string; titleVi?: string; partIndex: number; parts: number; start?: number; end?: number; dur?: number; pieces?: Array<{ start: number; end: number } | [number, number]>; ranges?: Array<[number, number]>; script?: string; reason?: string; status: 'planned' | 'cut' | 'sent' | 'failed'; jobId?: string; downloadUrl?: string; saved?: boolean; savedTo?: string; savedFile?: string; }
++export interface EditSegment { id: string; sourceId: string; sourceName: string; name: string; title?: string; titleVi?: string; partIndex: number; parts: number; start?: number; end?: number; dur?: number; pieces?: Array<{ start: number; end: number } | [number, number]>; ranges?: Array<[number, number]>; script?: string; reason?: string; status: 'planned' | 'cut' | 'sent' | 'failed'; jobId?: string; historyId?: string; sourceAvailable?: boolean; downloadUrl?: string; saved?: boolean; savedTo?: string; savedFile?: string; }

@@ -1,0 +1,284 @@
+diff --git a/ghostforge-server.js b/ghostforge-server.js
+index 3e9764a..79a87b3 100644
+--- a/ghostforge-server.js
++++ b/ghostforge-server.js
+@@ -10,7 +10,7 @@ import { fileURLToPath } from 'url';
+ import { runProcess } from './server/process.js';
+ import { jobs, subscribeJob, jobSignal, abortJob, ensureAbort } from './server/jobs.js';
+ import { createSaveDirStore } from './server/save-dir.js';
+-import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, isSpeakerIdentity, resolveSpeakerWho, validSpeakerTrackPoints, shouldUsePerPartDetailPlan, mergeSegmentDetail, parseSpeechLines, sourceTimeForTrackPoint, normalizeFrameMode, stitchFrames, clamp01, parseFraming, parseSpeakerTrack, snapSpeakerTrack, clampPlan, parseGeminiPlan } from './server/editor-plan.js';
++import { evenSplitPlan, round1, parseOnePiece, piecesFromSeg, scriptLabel, isSpeakerIdentity, resolveSpeakerWho, validSpeakerTrackPoints, shouldUsePerPartDetailPlan, mergeSegmentDetail, compactSceneCutHints, detailSceneCutGuidance, parseSpeechLines, sourceTimeForTrackPoint, normalizeFrameMode, stitchFrames, clamp01, parseFraming, parseSpeakerTrack, snapSpeakerTrack, clampPlan, parseGeminiPlan } from './server/editor-plan.js';
+ import { mapDiarizationEvidence, fallbackSpeechForAmbiguousTurns } from './server/local-listen-map.js';
+ import { runGoogleSttChunkWithRetry } from './server/google-stt-retry.js';
+ import { firstMeaningfulFfmpegError } from './server/ffmpeg-diagnostics.js';
+@@ -2559,9 +2559,9 @@ async function geminiUploadVideo(apiKey, filePath, displayName) {
+     throw new Error('Gemini still processing the video — try a shorter clip');
+ }
+ 
+-async function geminiGeneratePlan(apiKey, model, fileUri, userPrompt, duration, maxParts, minSec, autoParts = false, tiktokMix = false, testClip = false) {
++async function geminiGeneratePlan(apiKey, model, fileUri, userPrompt, duration, maxParts, minSec, autoParts = false, tiktokMix = false, testClip = false, sceneCuts = null) {
+     const modelId = String(model || 'gemini-3.8-flash').replace(/[^a-zA-Z0-9._-]/g, '') || 'gemini-3.8-flash';
+-    const sys = editorSysPrompt(userPrompt, duration, maxParts, minSec, autoParts, tiktokMix, testClip);
++    const sys = editorSysPrompt(userPrompt, duration, maxParts, minSec, autoParts, tiktokMix, testClip, sceneCuts);
+ 
+     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${encodeURIComponent(apiKey)}`;
+     const res = await fetch(url, {
+@@ -2584,7 +2584,7 @@ async function geminiGeneratePlan(apiKey, model, fileUri, userPrompt, duration,
+     }
+     const text = (j.candidates || []).map((c) => (c.content?.parts || []).map((p) => p.text || '').join('')).join('\n');
+     if (!text.trim()) throw new Error('Gemini returned empty text');
+-    return parseGeminiPlan(text, duration, maxParts, minSec, autoParts);
++    return parseGeminiPlan(text, duration, maxParts, minSec, autoParts, sceneCuts);
+ }
+ 
+ async function geminiDeleteFile(apiKey, fileName) {
+@@ -2654,7 +2654,7 @@ const vertexModelId = (model) => {
+     return m.replace(/[^a-zA-Z0-9._-]/g, '') || 'gemini-3.8-flash';
+ };
+ 
+-const editorSysPrompt = (userPrompt, duration, maxParts, minSec, autoParts = false, tiktokMix = false, testClip = false) => `You are a professional video editor. Watch AND listen to ${testClip ? 'THIS SHORT EXCERPT ONLY (do not imagine a longer movie)' : 'the entire video'}.
++const editorSysPrompt = (userPrompt, duration, maxParts, minSec, autoParts = false, tiktokMix = false, testClip = false, sceneCuts = null) => `You are a professional video editor. Watch AND listen to ${testClip ? 'THIS SHORT EXCERPT ONLY (do not imagine a longer movie)' : 'the entire video'}.
+ ${testClip ? `TEST: the file is ~${duration.toFixed(0)} seconds. Return EXACTLY 1 episode covering 0.0 → ${duration.toFixed(1)}. Also return spoken "lines" in the SAME JSON so there is no second watch.
+ ` : ''}User request:
+ ${String(userPrompt || '').slice(0, 4000)}
+@@ -2699,7 +2699,7 @@ FRAMING — required. 9:16 mix of WIDE vs CLOSE. Target 50–65% of the episode
+    NEVER set cx to a cup, bottle, chips, poster, laptop, or the brightest blob.
+    Left speaker ≈ 0.18–0.32, center ≈ 0.42–0.58, right ≈ 0.68–0.85.
+    Different speaker = new point at that INSTANT with the NEW face. Same speaker = hold the same cx. Camera must CUT, never slide.
+-` : ''}`;
++` : ''}${detailSceneCutGuidance(sceneCuts, duration)}`;
+ 
+ async function shrinkProxyForVertex(srcPath, job, onLog) {
+     const limit = 16 * 1024 * 1024;
+@@ -2731,7 +2731,7 @@ async function shrinkProxyForVertex(srcPath, job, onLog) {
+     return { filePath: current, extras, mb: fs.statSync(current).size / 1024 / 1024 };
+ }
+ 
+-async function vertexGeneratePlan(auth, model, videoPath, userPrompt, duration, maxParts, minSec, job, onLog, autoParts = false, tiktokMix = false, testClip = false, timingLabel = 'plan AI') {
++async function vertexGeneratePlan(auth, model, videoPath, userPrompt, duration, maxParts, minSec, job, onLog, autoParts = false, tiktokMix = false, testClip = false, timingLabel = 'plan AI', sceneCuts = null) {
+     const shrunk = await shrinkProxyForVertex(videoPath, job, onLog);
+     const filePath = shrunk.filePath;
+     if (onLog) onLog(`[EDIT] Vertex proxy ${shrunk.mb.toFixed(1)}MB`);
+@@ -2743,7 +2743,7 @@ async function vertexGeneratePlan(auth, model, videoPath, userPrompt, duration,
+             role: 'user',
+             parts: [
+                 { inlineData: { mimeType: 'video/mp4', data: b64 } },
+-                { text: editorSysPrompt(userPrompt, duration, maxParts, minSec, autoParts, tiktokMix, testClip) },
++                { text: editorSysPrompt(userPrompt, duration, maxParts, minSec, autoParts, tiktokMix, testClip, sceneCuts) },
+             ],
+         }],
+         generationConfig: { temperature: 0.2, responseMimeType: 'application/json' },
+@@ -2789,7 +2789,7 @@ async function vertexGeneratePlan(auth, model, videoPath, userPrompt, duration,
+                     lastErr = `Vertex empty @ ${loc}`;
+                     continue;
+                 }
+-                return parseGeminiPlan(text, duration, maxParts, minSec, autoParts);
++                return parseGeminiPlan(text, duration, maxParts, minSec, autoParts, sceneCuts);
+             } catch (err) {
+                 const m = err instanceof Error ? err.message : String(err);
+                 if (job && job.cancelled) throw new Error('cancelled');
+@@ -3467,7 +3467,12 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                     const detailProbe = await probeMedia(detailMedia);
+                     const detailDuration = Number(detailProbe.durationSec) || Number(seg.dur) || 0;
+                     const pieceCount = Array.isArray(seg.pieces) && seg.pieces.length ? seg.pieces.length : 1;
++                    const detailSceneCuts = compactSceneCutHints(
++                        await detectSceneTimes(detailMedia, detailDuration, job),
++                        detailDuration,
++                    );
+                     send('log', { message: `[EDIT] Detail PLAN ${ordinal}: ${pieceCount} piece${pieceCount === 1 ? '' : 's'} · local ${detailDuration.toFixed(1)}s` });
++                    send('log', { message: `[EDIT] Detail PLAN ${ordinal}: ${detailSceneCuts.length} candidate scene cuts` });
+ 
+                     const detailProxyStartedAt = Date.now();
+                     try {
+@@ -3494,6 +3499,7 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                                 detailPlan = await geminiGeneratePlan(
+                                     apiKey, model, uploaded.uri, userPrompt,
+                                     detailDuration, 1, detailMinSec, false, true, true,
++                                    detailSceneCuts,
+                                 );
+                             } finally {
+                                 logEditTiming(`detail AI ${ordinal}`, detailAiStartedAt);
+@@ -3507,7 +3513,7 @@ app.get('/api/edit/stream/:jobId', async (req, res) => {
+                             auth, model, detailProxy, userPrompt,
+                             detailDuration, 1, detailMinSec, job,
+                             (m) => send('log', { message: m }),
+-                            false, true, true, `detail AI ${ordinal}`,
++                            false, true, true, `detail AI ${ordinal}`, detailSceneCuts,
+                         );
+                     }
+                     const detailSeg = detailPlan?.segments?.[0];
+diff --git a/server/editor-plan.js b/server/editor-plan.js
+index 5846ee2..552b4b6 100644
+--- a/server/editor-plan.js
++++ b/server/editor-plan.js
+@@ -92,6 +92,31 @@ export const mergeSegmentDetail = (globalSegment, detailSegment) => {
+     };
+ };
+ 
++export const compactSceneCutHints = (sceneCuts, duration, maxHints = 80) => {
++    const dur = Math.max(0, Number(duration) || 0);
++    const limit = Math.max(1, Math.floor(Number(maxHints) || 80));
++    const cuts = [...new Set((Array.isArray(sceneCuts) ? sceneCuts : [])
++        .map((value) => Math.round(Number(value) * 10) / 10)
++        .filter((value) => Number.isFinite(value) && value > 0.35 && (!dur || value < dur - 0.35)))]
++        .sort((a, b) => a - b);
++    if (cuts.length <= limit) return cuts;
++    if (limit === 1) return [cuts[Math.floor(cuts.length / 2)]];
++    return Array.from({ length: limit }, (_, index) => cuts[Math.round(index * (cuts.length - 1) / (limit - 1))]);
++};
++
++export const detailSceneCutGuidance = (sceneCuts, duration) => {
++    if (!Array.isArray(sceneCuts)) return '';
++    const cuts = compactSceneCutHints(sceneCuts, duration);
++    const timestamps = cuts.length ? cuts.map((value) => value.toFixed(1)).join(', ') : 'none detected';
++    return `
++DETAIL SHOT-AWARE FRAMING:
++Candidate visual shot boundaries (seconds, local to this excerpt): ${timestamps}.
++These are hints, not mandatory cuts. Re-evaluate CONTAIN versus FILL at every candidate boundary and also at composition changes, reaction shots, speaker-focus changes, object reveals, visual-gag/action onset, or major camera movement.
++Merge across a candidate boundary only when the crop decision remains the same AND cropping preserves the same important visual information on both sides.
++Do not create more FILL merely to increase density. Use CONTAIN when cropping one subject would lose important action, reaction, object, text, joke, or spatial context. Use FILL when one subject clearly dominates and cropping loses no relevant visual information.
++`;
++};
++
+ export const parseSpeechLines = (parsed, duration) => {
+     const arr = (parsed && (parsed.lines || parsed.speech || parsed.utterances)) || [];
+     const dur = Math.max(0.2, Number(duration) || 0);
+@@ -145,8 +170,10 @@ export const normalizeFrameMode = (raw) => {
+     return '';
+ };
+ 
+-export const stitchFrames = (windows, epDur) => {
++export const stitchFrames = (windows, epDur, sceneCuts = null) => {
+     const dur = Math.max(0.2, Number(epDur) || 0);
++    const detailCuts = Array.isArray(sceneCuts) ? compactSceneCutHints(sceneCuts, dur) : null;
++    const semanticReason = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+     const list = (Array.isArray(windows) ? windows : [])
+         .filter((w) => w && (w.mode === 'fill' || w.mode === 'contain') && Number(w.b) - Number(w.a) >= 0.6)
+         .map((w) => ({
+@@ -171,12 +198,16 @@ export const stitchFrames = (windows, epDur) => {
+             out.push({ a: 0, b, mode: w.mode, why: w.why, cx: w.cx, cy: w.cy, cx2: w.cx2, cy2: w.cy2 });
+             continue;
+         }
++        const transitionStart = last.b;
+         if (a > last.b + 0.12) last.b = round1(a);
+         const sameAim = last.mode === w.mode
+             && last.mode !== 'fill'
+             && Math.abs((last.cx ?? 0.5) - (w.cx ?? 0.5)) < 0.08
+             && Math.abs((last.cy ?? 0.42) - (w.cy ?? 0.42)) < 0.08;
+-        if (sameAim) {
++        const sameReason = semanticReason(last.why) === semanticReason(w.why);
++        const crossesSceneCut = detailCuts?.some((cut) => cut >= Math.min(transitionStart, a) - 0.2 && cut <= Math.max(transitionStart, a) + 0.2) || false;
++        const preservesDetailBoundary = detailCuts !== null && (!sameReason || crossesSceneCut);
++        if (sameAim && !preservesDetailBoundary) {
+             last.b = round1(Math.max(last.b, b));
+             if (w.why && !last.why) last.why = w.why;
+             last.cx2 = w.cx2 ?? w.cx ?? last.cx2;
+@@ -206,7 +237,7 @@ export const clamp01 = (n, fallback) => {
+     return Math.max(0.05, Math.min(0.95, v));
+ };
+ 
+-export const parseFraming = (s, epStart, epEnd) => {
++export const parseFraming = (s, epStart, epEnd, sceneCuts = null) => {
+     const raw = (s && (s.frames || s.framing || s.shots || s.layout)) || [];
+     if (!Array.isArray(raw) || !raw.length) return [];
+     const epDur = Math.max(0.2, epEnd - epStart);
+@@ -242,7 +273,7 @@ export const parseFraming = (s, epStart, epEnd) => {
+         if (looksAbs) { a -= epStart; b -= epStart; }
+         return { ...x, a: Math.max(0, a), b: Math.min(epDur, b) };
+     });
+-    return stitchFrames(local, epDur);
++    return stitchFrames(local, epDur, sceneCuts);
+ };
+ 
+ export const parseSpeakerTrack = (s, epStart, epEnd) => {
+@@ -302,7 +333,7 @@ export const snapSpeakerTrack = (pts) => {
+     return out;
+ };
+ 
+-export const clampPlan = (segments, duration, maxParts, minSec, autoParts = false) => {
++export const clampPlan = (segments, duration, maxParts, minSec, autoParts = false, sceneCuts = null) => {
+     const dur = Math.max(0.2, Number(duration) || 0);
+     const min = Math.max(8, Number(minSec) || 60);
+     const cap = autoParts ? 24 : Math.max(1, Math.min(12, Number(maxParts) || 6));
+@@ -344,7 +375,7 @@ export const clampPlan = (segments, duration, maxParts, minSec, autoParts = fals
+             script: scriptLabel(pieces),
+             pieces,
+             ranges: pieces.map((p) => [p.start, p.end]),
+-            frames: parseFraming(s, start, end),
++            frames: parseFraming(s, start, end, sceneCuts),
+             track: parseSpeakerTrack(s, start, end),
+         });
+         if (out.length >= cap) break;
+@@ -417,7 +448,7 @@ export const clampPlan = (segments, duration, maxParts, minSec, autoParts = fals
+     return out;
+ };
+ 
+-export const parseGeminiPlan = (text, duration, maxParts, minSec, autoParts = false) => {
++export const parseGeminiPlan = (text, duration, maxParts, minSec, autoParts = false, sceneCuts = null) => {
+     const raw = String(text || '');
+     const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+     const jsonText = (fence ? fence[1] : raw).trim();
+@@ -430,7 +461,7 @@ export const parseGeminiPlan = (text, duration, maxParts, minSec, autoParts = fa
+     } catch {
+         throw new Error('Gemini JSON parse failed');
+     }
+-    const segs = clampPlan(parsed.segments || parsed.clips || [], duration, maxParts, minSec, autoParts);
++    const segs = clampPlan(parsed.segments || parsed.clips || [], duration, maxParts, minSec, autoParts, sceneCuts);
+     if (!segs.length) throw new Error('Gemini returned no usable segments');
+     return { summary: String(parsed.summary || '').slice(0, 300), segments: segs, _raw: parsed };
+ };
+diff --git a/tests/editor-plan.test.js b/tests/editor-plan.test.js
+index e2de8f0..82102c5 100644
+--- a/tests/editor-plan.test.js
++++ b/tests/editor-plan.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan, sourceTimeForTrackPoint, shouldUsePerPartDetailPlan, mergeSegmentDetail, isSpeakerIdentity, resolveSpeakerWho, parseSpeechLines } from '../server/editor-plan.js';
++import { evenSplitPlan, normalizeFrameMode, parseGeminiPlan, sourceTimeForTrackPoint, shouldUsePerPartDetailPlan, mergeSegmentDetail, compactSceneCutHints, detailSceneCutGuidance, stitchFrames, isSpeakerIdentity, resolveSpeakerWho, parseSpeechLines } from '../server/editor-plan.js';
+ 
+ test('evenSplitPlan creates contiguous bounded segments', () => {
+   const segs = evenSplitPlan(360, 3, 60, false);
+@@ -35,6 +35,41 @@ test('sourceTimeForTrackPoint maps concatenated time into the second piece', ()
+   assert.equal(sourceTimeForTrackPoint(pieces, 7, 10), 42);
+ });
+ 
++test('detail scene-cut guidance is bounded and opt-in', () => {
++  assert.equal(detailSceneCutGuidance(null, 120), '');
++  const cuts = compactSceneCutHints([0, 5.04, 5.06, 40, 119.9, 120], 120, 2);
++  assert.deepEqual(cuts, [5, 40]);
++  const guidance = detailSceneCutGuidance(cuts, 120);
++  assert.match(guidance, /Candidate visual shot boundaries.*5\.0, 40\.0/);
++  assert.match(guidance, /Re-evaluate CONTAIN versus FILL/);
++  assert.match(guidance, /Do not create more FILL merely to increase density/);
++});
++
++test('detail framing preserves different semantic contain reasons', () => {
++  const frames = stitchFrames([
++    { a: 0, b: 5, mode: 'contain', why: 'two-character visual gag' },
++    { a: 5, b: 10, mode: 'contain', why: 'object reveal across frame' },
++  ], 10, []);
++  assert.equal(frames.length, 2);
++});
++
++test('detail framing preserves a known scene-cut boundary', () => {
++  const frames = stitchFrames([
++    { a: 0, b: 5, mode: 'contain', why: 'same context' },
++    { a: 5, b: 10, mode: 'contain', why: 'same context' },
++  ], 10, [5]);
++  assert.equal(frames.length, 2);
++});
++
++test('detail framing may still merge genuinely identical adjacent windows', () => {
++  const frames = stitchFrames([
++    { a: 0, b: 5, mode: 'contain', why: 'same context' },
++    { a: 5, b: 10, mode: 'contain', why: 'same context' },
++  ], 10, []);
++  assert.equal(frames.length, 1);
++  assert.equal(frames[0].b, 10);
++});
++
+ test('per-part detail replaces only local frames and track', () => {
+   const global = {
+     start: 10,
+
